@@ -5,47 +5,45 @@
 #include <map>
 #include <string.h> // for memcpy
 
-static std::map<int, int> p2pOpHashMap; // <opHash, counter>
+static std::map<int, std::pair<int, int>>
+    p2pOpHashMap; // <opHash, sendCounter, recvCounter>
 
 void setP2pSlotInfo(int rank, int peerRank, size_t size, flagcxDataType_t dtype,
                     int isRecv, int *opHash, size_t *slotIdx) {
-  // std::size_t h1 = std::hash<size_t>()(rank);
-  // std::size_t h2 = std::hash<size_t>()(size);
-  // std::size_t h3 = std::hash<size_t>()(dtype);
-  // *opHash = static_cast<int>((h1 << 2) & (h2 >> 3) & (h3 << 1)) + peerRank;
-  // *opHash = rank * 10 + int(size / 1000) + dtype * 100 + (isRecv * 1000) +
-  int key =
-      rank * 10 + int(size / 1000) + dtype * 100 + (isRecv * 1000) + peerRank;
-  // peerRank;
-  // uint64_t h = 0;
-  // h ^= (uint64_t)rank;
-  // h ^= ((uint64_t)peerRank << 8);
-  // h ^= ((uint64_t)dtype << 16);
-  // h ^= ((uint64_t)isRecv << 20);
-  // h ^= ((uint64_t)(size >> 12) << 24); // compress size (~ divide by 4096)
-  // int key = (int)(h ^ (h >> 32));
+  // TODO: try a better hash function to reduce collisions
+  int key = rank * 1000 + int(size >> 12) + dtype * 100 + peerRank;
   int opHashCounter;
   auto it = p2pOpHashMap.find(key);
   if (it != p2pOpHashMap.end()) {
-    opHashCounter = it->second + 1;
-    it->second++;
+    if (isRecv) {
+      opHashCounter = ++(it->second.second);
+    } else {
+      opHashCounter = ++(it->second.first);
+    }
   } else {
+    if (isRecv) {
+      p2pOpHashMap[key] = std::make_pair(0, 1);
+    } else {
+      p2pOpHashMap[key] = std::make_pair(1, 0);
+    }
     opHashCounter = 1;
-    p2pOpHashMap[key] = opHashCounter;
   }
+  // Ensure that opHash is unique for each operation
   *opHash = key + opHashCounter;
-  // *opHash = key;
-  *slotIdx = (*opHash) % FLAGCX_P2P_MAX_OPS;
-  INFO(FLAGCX_P2P, "[%d, %d, %zu, %d] -> [%d, %d, %d]", rank, peerRank, size,
-       dtype, *slotIdx, *opHash, opHashCounter);
+  // First half slots for send, second half for recv
+  *slotIdx = (*opHash) % (FLAGCX_P2P_MAX_OPS / 2);
+  if (isRecv) {
+    *slotIdx += (FLAGCX_P2P_MAX_OPS / 2);
+  }
 }
 
 flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
                                   void *data, size_t size,
                                   struct flagcxProxyArgs *args) {
+  // Avoid further processing slots if done
   if (args->done == 1)
     return flagcxSuccess;
-  INFO(FLAGCX_P2P, "ProxySend BP1");
+  // Make sure data is valid
   if (!args->semaphore->pollStart())
     return flagcxSuccess;
 
@@ -53,47 +51,24 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
       &resources->proxyInfo.shm->slots[args->p2pSlotIdx];
   struct flagcxP2pSyncSlot *peerSlotPtr =
       &resources->proxyInfo.shm->slots[args->p2pPeerSlotIdx];
-  // Reset slot for new operation
-  // if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 1) {
-  // if ((slotPtr->opHash != -1 || slotPtr->done == 0) && slotPtr->peerDone ==
-  // 1) return flagcxSuccess;
+
+  // Reset slot for new operation, only if previous operation
+  // is done for both sides
   if (slotPtr->opHash == -1 && slotPtr->done == 1 && slotPtr->peerDone == 1) {
-    INFO(FLAGCX_P2P, "ProxySend BP1-1");
-    // volatile int *opHash = &slotPtr->opHash;
-    // *opHash = args->p2pOpHash;
-    // volatile int *done = &slotPtr->done;
-    // *done = 1;
-    // volatile uint64_t *sendHead = &slotPtr->sendHead;
-    // *sendHead = 0;
-    // volatile uint64_t *recvTail = &slotPtr->recvTail;
-    // *recvTail = FLAGCX_P2P_STEPS;
     slotPtr->opHash = args->p2pOpHash;
     slotPtr->done = 0;
     slotPtr->peerDone = 0;
     slotPtr->sendHead = 0;
     slotPtr->recvTail = FLAGCX_P2P_STEPS;
   }
-  INFO(FLAGCX_P2P, "ProxySend BP2");
 
-  // There is an existing operation in the slot that does not match this opHash
-  // and is not done yet
-  if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 0)
-    return flagcxSuccess;
-  // There is an existing operation in the peer slot that does not match peer
-  // opHash and is not done yet
-  if (peerSlotPtr->opHash != args->p2pPeerOpHash && peerSlotPtr->done == 0)
+  // Retry later since the slot is still in use
+  if (slotPtr->opHash != args->p2pOpHash)
     return flagcxSuccess;
 
-  INFO(FLAGCX_P2P,
-       "ProxySend BP3 with slotIdx=%d, slotOpHash=%d, opHash=%d, "
-       "peerSlotIdx=%d, peerSlotOpHash=%d, peerOpHash=%d",
-       args->p2pSlotIdx, slotPtr->opHash, args->p2pOpHash, args->p2pPeerSlotIdx,
-       peerSlotPtr->opHash, args->p2pPeerOpHash);
-  // If peer slot is not ready for this operation, return and retry later
-  // volatile int *peerOpHash = &peerSlotPtr->opHash;
-  // if (*peerOpHash != args->p2pPeerOpHash) return flagcxSuccess;
-  // if (peerSlotPtr->opHash != args->p2pPeerOpHash) return flagcxSuccess;
-  INFO(FLAGCX_P2P, "ProxySend BP4");
+  // Retry later since the peer slot is still in use
+  if (peerSlotPtr->opHash != args->p2pPeerOpHash && slotPtr->peerDone == 0)
+    return flagcxSuccess;
 
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
@@ -133,16 +108,14 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
       }
     }
   } else {
-    INFO(FLAGCX_P2P, "ProxySend BP5");
     if (args->done != 1) {
       if (slotPtr->done != 1) {
+        // Inform peer that this side is done
         if (peerSlotPtr->peerDone != 1) {
           peerSlotPtr->peerDone = 1;
-          INFO(FLAGCX_P2P, "ProxySend BP5-1");
         }
+        // Signal done only when the peer side is also done
         if (slotPtr->peerDone == 1) {
-          // slotPtr->opHash = -1;
-          // slotPtr->done = 1;
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
           args->semaphore->signalCounter(1);
@@ -154,10 +127,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
             }
           }
           args->done = 1;
-          INFO(FLAGCX_P2P, "ProxySend BP5-2");
         }
-      } else {
-        INFO(FLAGCX_P2P, "ProxySend BP5-3");
       }
     }
   }
@@ -167,9 +137,10 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
 flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
                                   void *data, size_t size,
                                   struct flagcxProxyArgs *args) {
+  // Avoid further processing slots if done
   if (args->done == 1)
     return flagcxSuccess;
-  INFO(FLAGCX_P2P, "ProxyRecv BP1");
+  // Make sure data is valid
   if (!args->semaphore->pollStart())
     return flagcxSuccess;
 
@@ -177,45 +148,24 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
       &resources->proxyInfo.shm->slots[args->p2pSlotIdx];
   struct flagcxP2pSyncSlot *peerSlotPtr =
       &resources->proxyInfo.shm->slots[args->p2pPeerSlotIdx];
-  // Reset slot for new operation
-  // if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 1) {
-  // if ((slotPtr->opHash != -1 || slotPtr->done == 0) && slotPtr->peerDone ==
-  // 1) return flagcxSuccess;
+
+  // Reset slot for new operation, only if previous operation
+  // is done for both sides
   if (slotPtr->opHash == -1 && slotPtr->done == 1 && slotPtr->peerDone == 1) {
-    INFO(FLAGCX_P2P, "ProxyRecv BP1-1");
-    // volatile int *opHash = &slotPtr->opHash;
-    // *opHash = args->p2pOpHash;
-    // volatile int *done = &slotPtr->done;
-    // *done = 1;
-    // volatile uint64_t *sendHead = &slotPtr->sendHead;
-    // *sendHead = 0;
-    // volatile uint64_t *recvTail = &slotPtr->recvTail;
-    // *recvTail = FLAGCX_P2P_STEPS;
     slotPtr->opHash = args->p2pOpHash;
     slotPtr->done = 0;
     slotPtr->peerDone = 0;
     slotPtr->sendHead = 0;
     slotPtr->recvTail = FLAGCX_P2P_STEPS;
   }
-  INFO(FLAGCX_P2P, "ProxyRecv BP2");
-  // There is an existing operation in the slot that does not match this opHash
-  // and is not done yet
-  if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 0)
+
+  // Return and retry later since the slot is still in use
+  if (slotPtr->opHash != args->p2pOpHash)
     return flagcxSuccess;
-  // There is an existing operation in the peer slot that does not match peer
-  // opHash and is not done yet
-  if (peerSlotPtr->opHash != args->p2pPeerOpHash && peerSlotPtr->done == 0)
+
+  // Retry later since the peer slot is still in use
+  if (peerSlotPtr->opHash != args->p2pPeerOpHash && slotPtr->peerDone == 0)
     return flagcxSuccess;
-  INFO(FLAGCX_P2P,
-       "ProxyRecv BP3 with slotIdx=%d, slotOpHash=%d, opHash=%d, "
-       "peerSlotIdx=%d, peerSlotOpHash=%d, peerOpHash=%d",
-       args->p2pSlotIdx, slotPtr->opHash, args->p2pOpHash, args->p2pPeerSlotIdx,
-       peerSlotPtr->opHash, args->p2pPeerOpHash);
-  // If peer slot is not ready for this operation, return and retry later
-  // volatile int *peerOpHash = &peerSlotPtr->opHash;
-  // if (*peerOpHash != args->p2pPeerOpHash) return flagcxSuccess;
-  // if (peerSlotPtr->opHash != args->p2pPeerOpHash) return flagcxSuccess;
-  INFO(FLAGCX_P2P, "ProxyRecv BP4");
 
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
@@ -254,16 +204,15 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
       }
     }
   } else {
-    INFO(FLAGCX_P2P, "ProxyRecv BP5");
     if (args->done != 1) {
       if (slotPtr->done != 1) {
+        // Inform peer that this side is done
         if (peerSlotPtr->peerDone != 1) {
           peerSlotPtr->peerDone = 1;
-          INFO(FLAGCX_P2P, "ProxyRecv BP5-1");
         }
+
+        // Signal done only when the peer side is also done
         if (slotPtr->peerDone == 1) {
-          // slotPtr->opHash = -1;
-          // slotPtr->done = 1;
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
           args->semaphore->signalCounter(1);
@@ -275,10 +224,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
             }
           }
           args->done = 1;
-          INFO(FLAGCX_P2P, "ProxyRecv BP5-2");
         }
-      } else {
-        INFO(FLAGCX_P2P, "ProxyRecv BP5-3");
       }
     }
   }
@@ -382,7 +328,7 @@ flagcxP2pSendProxyConnect(struct flagcxProxyConnection *connection,
 
   resources->proxyInfo.recvFifo = *((char **)reqBuff);
 
-  // Create CUDA stream and events for data transfers
+  // Create stream and events for data transfers
   FLAGCXCHECK(deviceAdaptor->streamCreate(&resources->proxyInfo.stream));
   for (int i = 0; i < FLAGCX_P2P_STEPS; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&resources->proxyInfo.events[i],
@@ -409,7 +355,7 @@ flagcxP2pRecvProxyConnect(struct flagcxProxyConnection *connection,
     return flagcxInternalError;
   }
 
-  // Create CUDA stream and events for data transfers
+  // Create stream and events for data transfers
   FLAGCXCHECK(deviceAdaptor->streamCreate(&resources->proxyInfo.stream));
   for (int i = 0; i < FLAGCX_P2P_STEPS; i++) {
     FLAGCXCHECK(deviceAdaptor->eventCreate(&resources->proxyInfo.events[i],
@@ -435,7 +381,7 @@ flagcxP2pAllocateShareableBuffer(size_t size, int directMap,
     return res;
   }
 
-  // Get the actual IPC handle data (fills handlePtr->base for CUDA)
+  // Get the actual IPC handle data
   res = deviceAdaptor->ipcMemHandleGet(handlePtr, *ptr);
   if (res != flagcxSuccess) {
     WARN("deviceAdaptor->ipcMemHandleGet failed for ptr %p size %zu", *ptr,
@@ -483,14 +429,14 @@ flagcxResult_t flagcxP2pSendProxyFree(struct flagcxP2pResources *resources) {
   if (resources == NULL)
     return flagcxSuccess;
 
-  // Destroy CUDA events
+  // Destroy events
   for (int s = 0; s < FLAGCX_P2P_STEPS; s++) {
     if (resources->proxyInfo.events[s] != NULL) {
       FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->proxyInfo.events[s]));
     }
   }
 
-  // Destroy CUDA stream
+  // Destroy stream
   if (resources->proxyInfo.stream != NULL) {
     FLAGCXCHECK(deviceAdaptor->streamDestroy(resources->proxyInfo.stream));
   }
@@ -508,14 +454,14 @@ flagcxResult_t flagcxP2pRecvProxyFree(struct flagcxP2pResources *resources) {
   if (resources == NULL)
     return flagcxSuccess;
 
-  // Destroy CUDA events
+  // Destroy events
   for (int s = 0; s < FLAGCX_P2P_STEPS; s++) {
     if (resources->proxyInfo.events[s] != NULL) {
       FLAGCXCHECK(deviceAdaptor->eventDestroy(resources->proxyInfo.events[s]));
     }
   }
 
-  // Destroy CUDA stream
+  // Destroy stream
   if (resources->proxyInfo.stream != NULL) {
     FLAGCXCHECK(deviceAdaptor->streamDestroy(resources->proxyInfo.stream));
   }

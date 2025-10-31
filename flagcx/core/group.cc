@@ -183,12 +183,14 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                            &op->args.p2pOpHash, &op->args.p2pSlotIdx);
             setP2pSlotInfo(peer, comm->rank, p2p->bytes, p2p->dtype, 1,
                            &op->args.p2pPeerOpHash, &op->args.p2pPeerSlotIdx);
-            // INFO(FLAGCX_P2P,
-            //      "Sender: [%d(rank), %d(peer)] -> [%d], [%d(peer), %d(rank)]
-            //      "
-            //      "-> [%d]",
-            //      comm->rank, peer, op->args.p2pSlotIdx, peer, comm->rank,
-            //      op->args.p2pPeerSlotIdx);
+            TRACE_CALL("Sender: [rank(%d), peerRank(%d)] -> [slotIdx(%ld), "
+                       "opHash(%d)]",
+                       comm->rank, peer, op->args.p2pSlotIdx,
+                       op->args.p2pOpHash);
+            TRACE_CALL("Sender: [peerRank(%d), rank(%d)] -> [peerSlotIdx(%ld), "
+                       "peerOpHash(%d)]",
+                       peer, comm->rank, op->args.p2pPeerSlotIdx,
+                       op->args.p2pPeerOpHash);
           }
 
           // launch proxyRegister op if not yet registered
@@ -256,12 +258,14 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                            &op->args.p2pOpHash, &op->args.p2pSlotIdx);
             setP2pSlotInfo(peer, comm->rank, p2p->bytes, p2p->dtype, 0,
                            &op->args.p2pPeerOpHash, &op->args.p2pPeerSlotIdx);
-            // INFO(FLAGCX_P2P,
-            //      "Receiver: [%d(rank), %d(peer)] -> [%d], [%d(peer),
-            //      %d(rank)] "
-            //      "-> [%d]",
-            //      comm->rank, peer, op->args.p2pSlotIdx, peer, comm->rank,
-            //      op->args.p2pPeerSlotIdx);
+            TRACE_CALL("Receiver: [rank(%d), peerRank(%d)] -> [slotIdx(%ld), "
+                       "opHash(%d)]",
+                       comm->rank, peer, op->args.p2pSlotIdx,
+                       op->args.p2pOpHash);
+            TRACE_CALL("Receiver: [peerRank(%d), rank(%d)] -> "
+                       "[peerSlotIdx(%ld), peerOpHash(%d)]",
+                       peer, comm->rank, op->args.p2pPeerSlotIdx,
+                       op->args.p2pPeerOpHash);
           }
 
           // launch proxyRegister op if not yet registered
