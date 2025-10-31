@@ -15,6 +15,7 @@
   (FLAGCX_P2P_BUFFERSIZE / FLAGCX_P2P_CHUNKSIZE) // 16 steps
 #define FLAGCX_P2P_MAX_OPS                                                     \
   32 // Maximum number of concurrent P2P operation pairs
+#define FLAGCX_P2P_IPC_HANDLE_SIZE 64
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,11 +27,12 @@ struct flagcxP2pRequest {
 };
 
 typedef union {
-  char reserved[64]; // Generic 64-byte buffer (same size as cudaIpcMemHandle_t)
+  char reserved[FLAGCX_P2P_IPC_HANDLE_SIZE]; // Generic 64-byte buffer, may
+                                             // differ on different devices
 } flagcxIpcHandleData;
 
 struct flagcxP2pIpcDesc {
-  flagcxIpcHandleData handleData; // Actual IPC handle data (64 bytes)
+  flagcxIpcHandleData handleData; // Actual IPC handle data
   size_t size;
 };
 
@@ -67,7 +69,7 @@ struct flagcxP2pShmProxyInfo {
   struct flagcxP2pShm *shm;
   flagcxShmIpcDesc_t desc;
 
-  // GPU side
+  // Device side
   char *recvFifo;
   flagcxStream_t stream;
   flagcxEvent_t events[FLAGCX_P2P_STEPS];
