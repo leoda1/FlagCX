@@ -14,14 +14,16 @@ void setP2pSlotInfo(int rank, int peerRank, size_t size, flagcxDataType_t dtype,
   // std::size_t h3 = std::hash<size_t>()(dtype);
   // *opHash = static_cast<int>((h1 << 2) & (h2 >> 3) & (h3 << 1)) + peerRank;
   // *opHash = rank * 10 + int(size / 1000) + dtype * 100 + (isRecv * 1000) +
+  int key =
+      rank * 10 + int(size / 1000) + dtype * 100 + (isRecv * 1000) + peerRank;
   // peerRank;
-  uint64_t h = 0;
-  h ^= (uint64_t)rank;
-  h ^= ((uint64_t)peerRank << 8);
-  h ^= ((uint64_t)dtype << 16);
-  h ^= ((uint64_t)isRecv << 20);
-  h ^= ((uint64_t)(size >> 12) << 24); // compress size (~ divide by 4096)
-  int key = (int)(h ^ (h >> 32));
+  // uint64_t h = 0;
+  // h ^= (uint64_t)rank;
+  // h ^= ((uint64_t)peerRank << 8);
+  // h ^= ((uint64_t)dtype << 16);
+  // h ^= ((uint64_t)isRecv << 20);
+  // h ^= ((uint64_t)(size >> 12) << 24); // compress size (~ divide by 4096)
+  // int key = (int)(h ^ (h >> 32));
   int opHashCounter;
   auto it = p2pOpHashMap.find(key);
   if (it != p2pOpHashMap.end()) {
@@ -31,11 +33,11 @@ void setP2pSlotInfo(int rank, int peerRank, size_t size, flagcxDataType_t dtype,
     opHashCounter = 1;
     p2pOpHashMap[key] = opHashCounter;
   }
-  // *opHash = key + opHashCounter;
-  *opHash = key;
-  *slotIdx = *opHash % FLAGCX_P2P_MAX_OPS;
-  // INFO(FLAGCX_P2P, "[%d, %d, %zu, %d] -> [%d, %d, %d]", rank, peerRank, size,
-  // dtype, *slotIdx, *opHash, opHashCounter);
+  *opHash = key + opHashCounter;
+  // *opHash = key;
+  *slotIdx = (*opHash) % FLAGCX_P2P_MAX_OPS;
+  INFO(FLAGCX_P2P, "[%d, %d, %zu, %d] -> [%d, %d, %d]", rank, peerRank, size,
+       dtype, *slotIdx, *opHash, opHashCounter);
 }
 
 flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
@@ -78,8 +80,10 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
   if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 0)
     return flagcxSuccess;
   // There is an existing operation in the peer slot that does not match peer
-  // opHash and is not done yet if (peerSlotPtr->opHash != args->p2pPeerOpHash
-  // && peerSlotPtr->done == 0) return flagcxSuccess;
+  // opHash and is not done yet
+  if (peerSlotPtr->opHash != args->p2pPeerOpHash && peerSlotPtr->done == 0)
+    return flagcxSuccess;
+
   INFO(FLAGCX_P2P,
        "ProxySend BP3 with slotIdx=%d, slotOpHash=%d, opHash=%d, "
        "peerSlotIdx=%d, peerSlotOpHash=%d, peerOpHash=%d",
@@ -141,7 +145,6 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
           // slotPtr->done = 1;
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-          INFO(FLAGCX_P2P, "ProxySend BP5-2");
           args->semaphore->signalCounter(1);
           if (deviceAsyncLoad && deviceAsyncStore) {
             if (args->deviceFuncRelaxedOrdering == 1) {
@@ -151,9 +154,10 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
             }
           }
           args->done = 1;
-          INFO(FLAGCX_P2P, "ProxySend BP5-3");
+          INFO(FLAGCX_P2P, "ProxySend BP5-2");
         }
-        INFO(FLAGCX_P2P, "ProxySend BP5-4");
+      } else {
+        INFO(FLAGCX_P2P, "ProxySend BP5-3");
       }
     }
   }
@@ -199,8 +203,9 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
   if (slotPtr->opHash != args->p2pOpHash && slotPtr->done == 0)
     return flagcxSuccess;
   // There is an existing operation in the peer slot that does not match peer
-  // opHash and is not done yet if (peerSlotPtr->opHash != args->p2pPeerOpHash
-  // && peerSlotPtr->done == 0) return flagcxSuccess;
+  // opHash and is not done yet
+  if (peerSlotPtr->opHash != args->p2pPeerOpHash && peerSlotPtr->done == 0)
+    return flagcxSuccess;
   INFO(FLAGCX_P2P,
        "ProxyRecv BP3 with slotIdx=%d, slotOpHash=%d, opHash=%d, "
        "peerSlotIdx=%d, peerSlotOpHash=%d, peerOpHash=%d",
@@ -261,7 +266,6 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
           // slotPtr->done = 1;
           __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
           __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
-          INFO(FLAGCX_P2P, "ProxyRecv BP5-2");
           args->semaphore->signalCounter(1);
           if (deviceAsyncLoad && deviceAsyncStore) {
             if (args->deviceFuncRelaxedOrdering == 1) {
@@ -271,9 +275,10 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
             }
           }
           args->done = 1;
-          INFO(FLAGCX_P2P, "ProxyRecv BP5-3");
+          INFO(FLAGCX_P2P, "ProxyRecv BP5-2");
         }
-        INFO(FLAGCX_P2P, "ProxyRecv BP5-4");
+      } else {
+        INFO(FLAGCX_P2P, "ProxyRecv BP5-3");
       }
     }
   }
