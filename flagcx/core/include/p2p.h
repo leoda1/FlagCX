@@ -145,8 +145,7 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        struct flagcxReg *regRecord,
                                        int *regBufFlag,
                                        uintptr_t *offsetOut, 
-                                       uintptr_t **peerRmtAddrsOut,
-                                       bool *isLegacyIpc);
+                                       uintptr_t **peerRmtAddrsOut);
 
 flagcxResult_t flagcxP2pDeregisterBuffer(struct flagcxHeteroComm *comm,
                                          struct flagcxIpcRegInfo *info);

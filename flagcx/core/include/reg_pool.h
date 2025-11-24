@@ -14,7 +14,7 @@ public:
   flagcxRegPool();
   ~flagcxRegPool();
 
-  inline void getPagedAddr(void *data, size_t length, uintptr_t *beginAddr,
+  void getPagedAddr(void *data, size_t length, uintptr_t *beginAddr,
                            uintptr_t *endAddr);
   flagcxResult_t addNetHandle(void *comm, flagcxRegItem *reg, void *handle,
                               struct flagcxProxyConnector *proxyConn);

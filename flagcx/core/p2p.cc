@@ -483,8 +483,8 @@ flagcxResult_t flagcxP2pImportShareableBuffer(struct flagcxHeteroComm *comm,
 
 static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *userbuff,
                                         size_t buffsize, struct flagcxConnector **peerConns,
-                                        int* peerRanks, int nPeers, 
-                                        flagcxReg *regRecord, int* regBufFlag, uintptr_t* offsetOut, 
+                                        int* peerRanks, int nPeers, flagcxReg *regRecord, 
+                                        int* regBufFlag, uintptr_t* offsetOut, 
                                         uintptr_t** peerRmtAddrsOut, bool* isLegacyIpc) {
   flagcxResult_t ret = flagcxSuccess;
   *regBufFlag = 0;
@@ -499,10 +499,10 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
   flagcxRegItem *regItem = globalRegPool.getItem(comm, const_cast<void*>(userbuff));
   if (regItem == NULL) return flagcxSuccess;
   
-  int peerLocalRank = -1;
+  // int peerLocalRank = -1;
   for (int p = 0; p < nPeers; p++) {
     int peerRank = peerRanks[p];
-    peerLocalRank = comm->rankToLocalRank[peerRank];
+    // peerLocalRank = comm->rankToLocalRank[peerRank];
     
     struct flagcxConnector *peerConn = peerConns[p];
     if (peerConn == NULL) {
@@ -533,8 +533,6 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
       if (baseAddr == 0) {
         // Get page-aligned base address and size
         globalRegPool.getPagedAddr(const_cast<void*>(userbuff), buffsize, &baseAddr, &baseSize);
-        
-        // 假设支持 legacy CUDA IPC（简化实现）
         legacyIpcCap = 1;
       }
       
@@ -623,29 +621,17 @@ fail:
 
 flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        const void *userbuff, size_t buffSize,
-                                       int *peerRanks, int nPeers, 
-                                       flagcxReg *regRecord,
-                                       int *regBufFlag,
-                                       uintptr_t *offsetOut, uintptr_t **peerRmtAddrsOut,
-                                       bool *isLegacyIpc) {
-  INFO(FLAGCX_REG,
-       "comm=%p userbuff=%p buffSize=%zu peers=%d",
-       comm, userbuff, buffSize, nPeers);
-  
-  if (regBufFlag) *regBufFlag = 0;
-  if (offsetOut) *offsetOut = 0;
-  if (peerRmtAddrsOut) *peerRmtAddrsOut = nullptr;
-
-  if (!comm || !userbuff || buffSize == 0 || nPeers <= 0 ||
-      !peerConns || !peerRanks || !regBufFlag || !offsetOut || !peerRmtAddrsOut)
-    return flagcxSuccess;
-  if (regRecord == NULL)
-    return flagcxSuccess;
-
-  FLAGCXCHECK(p2pRegisterBuffer(comm, userbuff, buffSize,
-                                peerConns, peerRanks, nPeers,
-                                regRecord, regBufFlag, offsetOut,
-                                peerRmtAddrsOut, isLegacyIpc));
+                                       struct flagcxConnector **peerConns,
+                                       int *peerRanks, int nPeers, int *regBufFlag,
+                                       uintptr_t *offsetOut, uintptr_t **peerRmtAddrsOut) {
+  struct flagcxReg *regRecord = NULL;
+  *regBufFlag = 0;
+  *offsetOut = 0;
+  *peerRmtAddrsOut = NULL;
+  if (comm && userbuff && buffSize > 0 && nPeers > 0) {
+    FLAGCXCHECK(p2pRegisterBuffer(comm, userbuff, buffSize, peerConns, peerRanks, nPeers, regRecord, 
+                                  regBufFlag, offsetOut, peerRmtAddrsOut, NULL));
+  }
   return flagcxSuccess;
 }
 
