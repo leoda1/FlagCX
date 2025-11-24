@@ -42,8 +42,6 @@ struct flagcxP2pBuff {
   flagcxP2pIpcDesc ipcDesc;
 };
 
-
-
 struct flagcxP2pConnectInfo {
   int rank;
   int read;
@@ -142,7 +140,6 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        const void *userbuff, size_t buffSize,
                                        struct flagcxConnector **peerConns,
                                        int *peerRanks, int nPeers,
-                                       struct flagcxReg *regRecord,
                                        int *regBufFlag,
                                        uintptr_t *offsetOut, 
                                        uintptr_t **peerRmtAddrsOut);

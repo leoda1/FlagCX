@@ -195,6 +195,25 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                   "peerOpHash(%d)]",
                   peer, comm->rank, op->args.p2pPeerSlotIdx,
                   op->args.p2pPeerOpHash);
+
+              flagcxConnector *sendConn = &comm->channels[op->channelId]
+                                            .peers[peer]
+                                            ->send[0];
+              flagcxConnector *peerConns[] = {sendConn};
+              int peerRanks[] = {peer};
+              uintptr_t regOffset = 0;
+              uintptr_t *peerRmtAddr = NULL;
+              op->args.regBufFlag = 0;
+              FLAGCXCHECK(flagcxP2pRegisterBuffer(
+                  comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
+                  &op->args.regBufFlag, &regOffset, &peerRmtAddr));
+              if (op->args.regBufFlag) {
+                INFO(FLAGCX_REG,
+                     "flagcxGroup P2P send reg rank %d -> %d buff %p size %zu "
+                     "offset %zu remote %p",
+                     comm->rank, peer, p2p->buff, p2p->bytes, (size_t)regOffset,
+                     peerRmtAddr ? (void *)(*peerRmtAddr) : NULL);
+              }
             }
             // launch proxyRegister op if not yet registered
             if (op->connection->transport == TRANSPORT_NET) {
@@ -273,6 +292,25 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                          "[peerSlotIdx(%ld), peerOpHash(%d)]",
                          peer, comm->rank, op->args.p2pPeerSlotIdx,
                          op->args.p2pPeerOpHash);
+
+              flagcxConnector *recvConn = &comm->channels[op->channelId]
+                                            .peers[peer]
+                                            ->recv[0];
+              flagcxConnector *peerConns[] = {recvConn};
+              int peerRanks[] = {peer};
+              uintptr_t regOffset = 0;
+              uintptr_t *peerRmtAddr = NULL;
+              op->args.regBufFlag = 0;
+              FLAGCXCHECK(flagcxP2pRegisterBuffer(
+                  comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
+                  &op->args.regBufFlag, &regOffset, &peerRmtAddr));
+              if (op->args.regBufFlag) {
+                INFO(FLAGCX_REG,
+                     "flagcxGroup P2P recv reg rank %d <- %d buff %p size %zu "
+                     "offset %zu remote %p",
+                     comm->rank, peer, p2p->buff, p2p->bytes, (size_t)regOffset,
+                     peerRmtAddr ? (void *)(*peerRmtAddr) : NULL);
+              }
             }
             // launch proxyRegister op if not yet registered
             if (op->connection->transport == TRANSPORT_NET) {

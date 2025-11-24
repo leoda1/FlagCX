@@ -8,7 +8,6 @@
 #include <map>
 #include <string.h> // for memcpy
 
-// P2P IPC 导出信息结构
 struct p2pIpcExpInfo {
   flagcxP2pIpcDesc ipcDesc;
   bool legacyIpcCap;
@@ -495,9 +494,21 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
   uintptr_t baseSize = 0;
   
   if (isLegacyIpc) *isLegacyIpc = false;
-  if (regRecord == NULL) return flagcxSuccess;
+  if (regRecord == NULL) {
+    INFO(FLAGCX_REG, "p2pRegisterBuffer skip: regRecord is NULL for buff %p size %zu", userbuff, buffsize);
+    return flagcxSuccess;
+  }
   flagcxRegItem *regItem = globalRegPool.getItem(comm, const_cast<void*>(userbuff));
-  if (regItem == NULL) return flagcxSuccess;
+  if (regItem == NULL) {
+    INFO(FLAGCX_REG,
+         "p2pRegisterBuffer skip: no regItem found for buff %p size %zu regAddr %p",
+         userbuff, buffsize, (void*)regRecord->addr);
+    return flagcxSuccess;
+  }
+  INFO(FLAGCX_REG,
+       "p2pRegisterBuffer enter: rank %d buff %p size %zu regAddr %p handles=%zu peers=%d",
+       comm ? comm->rank : -1, userbuff, buffsize, (void*)regRecord->addr,
+       regItem->handles.size(), nPeers);
   
   // int peerLocalRank = -1;
   for (int p = 0; p < nPeers; p++) {
@@ -506,6 +517,7 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
     
     struct flagcxConnector *peerConn = peerConns[p];
     if (peerConn == NULL) {
+      INFO(FLAGCX_REG, "rank %d - peer %d connector is NULL, skipping registration", comm ? comm->rank : -1, peerRank);
       continue;
     }
     struct flagcxProxyConnector* peerProxyConn = &peerConn->proxyConn;
@@ -534,6 +546,9 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
         // Get page-aligned base address and size
         globalRegPool.getPagedAddr(const_cast<void*>(userbuff), buffsize, &baseAddr, &baseSize);
         legacyIpcCap = 1;
+        INFO(FLAGCX_REG,
+             "rank %d - computed paged base addr %p size %zu for buff %p",
+             comm ? comm->rank : -1, (void*)baseAddr, baseSize, userbuff);
       }
       
       if (legacyIpcCap) {
@@ -555,7 +570,8 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
         if (isLegacyIpc) *isLegacyIpc = true;
       } else {
         // cuMem or other advanced IPC mechanism not supported yet
-        WARN("Non-legacy IPC not fully implemented yet");
+           WARN("rank %d - Non-legacy IPC not fully implemented yet for peer %d",
+             comm ? comm->rank : -1, peerRank);
         goto fail;
       }
       
@@ -607,6 +623,10 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
       if (handlePair.second.proxyConn == targetProxyConn && handlePair.second.handle) {
         flagcxIpcRegInfo *info = (flagcxIpcRegInfo*)handlePair.second.handle;
         *peerRmtAddrsOut = (uintptr_t*)info->impInfo.rmtRegAddr;
+        INFO(FLAGCX_REG,
+             "rank %d - returning remote addr %p offset %zu for buff %p",
+             comm ? comm->rank : -1, info->impInfo.rmtRegAddr,
+             (uintptr_t)userbuff - regRecord->addr, userbuff);
         break;
       }
     }
@@ -624,13 +644,36 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        struct flagcxConnector **peerConns,
                                        int *peerRanks, int nPeers, int *regBufFlag,
                                        uintptr_t *offsetOut, uintptr_t **peerRmtAddrsOut) {
+  flagcxReg tempReg = {};
   struct flagcxReg *regRecord = NULL;
   *regBufFlag = 0;
   *offsetOut = 0;
   *peerRmtAddrsOut = NULL;
   if (comm && userbuff && buffSize > 0 && nPeers > 0) {
+    INFO(FLAGCX_REG,
+         "flagcxP2pRegisterBuffer enter: comm=%p rank=%d buff=%p size=%zu nPeers=%d",
+         comm, comm->rank, userbuff, buffSize, nPeers);
+    flagcxRegItem *regItem =
+        globalRegPool.getItem(comm, const_cast<void *>(userbuff));
+    if (regItem != NULL) {
+      tempReg.addr = regItem->beginAddr;
+      tempReg.baseAddr = regItem->beginAddr;
+      tempReg.baseSize = regItem->endAddr - regItem->beginAddr;
+      tempReg.regSize = tempReg.baseSize;
+      regRecord = &tempReg;
+    } else {
+      INFO(FLAGCX_REG, "flagcxP2pRegisterBuffer: no regItem for buff %p size %zu", userbuff, buffSize);
+    }
     FLAGCXCHECK(p2pRegisterBuffer(comm, userbuff, buffSize, peerConns, peerRanks, nPeers, regRecord, 
                                   regBufFlag, offsetOut, peerRmtAddrsOut, NULL));
+    INFO(FLAGCX_REG,
+         "flagcxP2pRegisterBuffer exit: buff=%p regBufFlag=%d offset=%zu peerAddr=%p",
+         userbuff, *regBufFlag, *offsetOut,
+         peerRmtAddrsOut && *peerRmtAddrsOut ? *peerRmtAddrsOut : NULL);
+  } else {
+    INFO(FLAGCX_REG,
+         "flagcxP2pRegisterBuffer skip: comm=%p buff=%p size=%zu nPeers=%d",
+         comm, userbuff, buffSize, nPeers);
   }
   return flagcxSuccess;
 }
