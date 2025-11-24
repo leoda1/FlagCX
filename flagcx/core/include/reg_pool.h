@@ -16,7 +16,12 @@ public:
 
   inline void getPagedAddr(void *data, size_t length, uintptr_t *beginAddr,
                            uintptr_t *endAddr);
+  flagcxResult_t addNetHandle(void *comm, flagcxRegItem *reg, void *handle,
+                              struct flagcxProxyConnector *proxyConn);
   flagcxResult_t removeRegItemNetHandles(void *comm, flagcxRegItem *reg);
+  flagcxResult_t addP2pHandle(void *comm, flagcxRegItem *reg, void *handle,
+                              struct flagcxProxyConnector *proxyConn);
+  flagcxResult_t removeRegItemP2pHandles(void *comm, flagcxRegItem *reg);
   flagcxResult_t registerBuffer(void *comm, void *data, size_t length);
   flagcxResult_t deregisterBuffer(void *comm, void *handle);
   std::map<uintptr_t, std::map<uintptr_t, flagcxRegItem *>> &getGlobalMap();

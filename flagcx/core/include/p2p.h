@@ -42,6 +42,8 @@ struct flagcxP2pBuff {
   flagcxP2pIpcDesc ipcDesc;
 };
 
+
+
 struct flagcxP2pConnectInfo {
   int rank;
   int read;
@@ -58,9 +60,19 @@ struct flagcxP2pSyncSlot {
   int peerDone; // 1 = slot is free, 0 = slot is in use
 };
 
+struct p2pRegInfo {
+  int copyDone;          // Indicates if the copy operation is complete
+  int copyStarted;       // Indicates if the copy operation has started
+  int receiverReady;     // Indicates if the receiver is ready to receive data
+  void* receiverRegAddr; // Address of the receiver's registered memory (shared)
+  ssize_t receiverRegBytes; // Size of the registered memory region
+};
+
 struct flagcxP2pShm {
   // Array of synchronization slots for multiple concurrent operations
   struct flagcxP2pSyncSlot slots[FLAGCX_P2P_MAX_OPS];
+  // Array of registration info for multiple concurrent operations
+  struct p2pRegInfo regInfos[FLAGCX_P2P_MAX_OPS];
 };
 
 // need to make sure this matches flagcxP2pShmProxyInfo in p2p.cc
@@ -125,6 +137,19 @@ flagcxResult_t flagcxP2pImportShareableBuffer(struct flagcxHeteroComm *comm,
                                               int peer, size_t size,
                                               struct flagcxP2pIpcDesc *ipcDesc,
                                               void **devMemPtr);
+
+flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
+                                       const void *userbuff, size_t buffSize,
+                                       struct flagcxConnector **peerConns,
+                                       int *peerRanks, int nPeers,
+                                       struct flagcxReg *regRecord,
+                                       int *regBufFlag,
+                                       uintptr_t *offsetOut, 
+                                       uintptr_t **peerRmtAddrsOut,
+                                       bool *isLegacyIpc);
+
+flagcxResult_t flagcxP2pDeregisterBuffer(struct flagcxHeteroComm *comm,
+                                         struct flagcxIpcRegInfo *info);
 
 flagcxResult_t flagcxP2pSendProxyFree(struct flagcxP2pResources *resources);
 
