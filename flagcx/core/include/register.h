@@ -45,6 +45,7 @@ struct flagcxIpcRegInfo {
   void* baseAddr;
   struct flagcxProxyConnector* ipcProxyconn;
   struct flagcxIpcImpInfo impInfo;
+  bool handleReady;
 };
 
 struct flagcxRegItem {

@@ -62,6 +62,8 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
       &resources->proxyInfo.shm->slots[args->p2pSlotIdx];
   struct flagcxP2pSyncSlot *peerSlotPtr =
       &resources->proxyInfo.shm->slots[args->p2pPeerSlotIdx];
+  struct p2pRegInfo *regInfoPtr =
+      &resources->proxyInfo.shm->regInfos[args->p2pSlotIdx];
 
   // Reset slot for new operation, only if previous operation
   // is done for both sides
@@ -71,6 +73,9 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
     slotPtr->peerDone = 0;
     slotPtr->sendHead = 0;
     slotPtr->recvTail = FLAGCX_P2P_STEPS;
+    // Reset reg info for new operation
+    regInfoPtr->copyStarted = 0;
+    regInfoPtr->copyDone = 0;
   }
 
   // Retry later since the slot is still in use
@@ -81,6 +86,56 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
   if (peerSlotPtr->opHash != args->p2pPeerOpHash && slotPtr->peerDone == 0)
     return flagcxSuccess;
 
+  // Zero-copy mode: sender directly copies to receiver's buffer
+  if (args->regBufFlag && args->p2pRmtAddr) {
+    if (args->transmitted < args->chunkSteps) {
+      // Single-step copy directly to receiver's buffer
+      if (args->copied == 0) {
+        regInfoPtr->copyStarted = 1;
+        FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+            (void*)args->p2pRmtAddr, data, size, flagcxMemcpyDeviceToDevice,
+            resources->proxyInfo.stream, NULL));
+        FLAGCXCHECK(deviceAdaptor->eventRecord(
+            resources->proxyInfo.events[0], resources->proxyInfo.stream));
+        args->copied = args->chunkSteps;  // Mark all chunks as copied
+        args->totalCopySize = size;
+      }
+      
+      // Check if copy is complete
+      if (args->transmitted < args->copied) {
+        flagcxResult_t res = deviceAdaptor->eventQuery(resources->proxyInfo.events[0]);
+        if (res == flagcxSuccess) {
+          args->transmitted = args->chunkSteps;
+          regInfoPtr->copyDone = 1;  // Signal to receiver that copy is done
+        }
+      }
+    } else {
+      // Cleanup phase
+      if (args->done != 1) {
+        if (slotPtr->done != 1) {
+          if (peerSlotPtr->peerDone != 1) {
+            peerSlotPtr->peerDone = 1;
+          }
+          if (slotPtr->peerDone == 1) {
+            __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
+            __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
+            args->semaphore->signalCounter(1);
+            if (deviceAsyncLoad && deviceAsyncStore) {
+              if (args->deviceFuncRelaxedOrdering == 1) {
+                FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+                    args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
+                    flagcxMemcpyHostToDevice, resources->proxyInfo.stream, NULL));
+              }
+            }
+            args->done = 1;
+          }
+        }
+      }
+    }
+    return flagcxSuccess;
+  }
+
+  // Non-zero-copy mode: use FIFO buffer
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
         args->copied - args->transmitted < FLAGCX_P2P_STEPS) {
@@ -159,6 +214,9 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
       &resources->proxyInfo.shm->slots[args->p2pSlotIdx];
   struct flagcxP2pSyncSlot *peerSlotPtr =
       &resources->proxyInfo.shm->slots[args->p2pPeerSlotIdx];
+  // For zero-copy, receiver checks sender's regInfo (using peerSlotIdx)
+  struct p2pRegInfo *peerRegInfoPtr =
+      &resources->proxyInfo.shm->regInfos[args->p2pPeerSlotIdx];
 
   // Reset slot for new operation, only if previous operation
   // is done for both sides
@@ -178,6 +236,42 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
   if (peerSlotPtr->opHash != args->p2pPeerOpHash && slotPtr->peerDone == 0)
     return flagcxSuccess;
 
+  // Zero-copy mode: receiver just waits for sender to complete the copy
+  if (args->regBufFlag) {
+    if (args->transmitted < args->chunkSteps) {
+      // Wait for sender to signal copyDone
+      if (peerRegInfoPtr->copyDone == 1) {
+        args->copied = args->chunkSteps;
+        args->transmitted = args->chunkSteps;
+        args->totalCopySize = size;
+      }
+    } else {
+      // Cleanup phase
+      if (args->done != 1) {
+        if (slotPtr->done != 1) {
+          if (peerSlotPtr->peerDone != 1) {
+            peerSlotPtr->peerDone = 1;
+          }
+          if (slotPtr->peerDone == 1) {
+            __atomic_store_n(&slotPtr->opHash, -1, __ATOMIC_RELAXED);
+            __atomic_store_n(&slotPtr->done, 1, __ATOMIC_RELEASE);
+            args->semaphore->signalCounter(1);
+            if (deviceAsyncLoad && deviceAsyncStore) {
+              if (args->deviceFuncRelaxedOrdering == 1) {
+                FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
+                    args->dlArgs, (void *)&args->hlArgs, sizeof(bool),
+                    flagcxMemcpyHostToDevice, resources->proxyInfo.stream, NULL));
+              }
+            }
+            args->done = 1;
+          }
+        }
+      }
+    }
+    return flagcxSuccess;
+  }
+
+  // Non-zero-copy mode: use FIFO buffer
   if (args->transmitted < args->chunkSteps) {
     if (args->copied < args->chunkSteps &&
         args->copied - args->transmitted < FLAGCX_P2P_STEPS) {
@@ -482,9 +576,10 @@ flagcxResult_t flagcxP2pImportShareableBuffer(struct flagcxHeteroComm *comm,
 
 static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *userbuff,
                                         size_t buffsize, struct flagcxConnector **peerConns,
-                                        int* peerRanks, int nPeers, flagcxReg *regRecord, 
-                                        int* regBufFlag, uintptr_t* offsetOut, 
-                                        uintptr_t** peerRmtAddrsOut, bool* isLegacyIpc) {
+                                        int* peerRanks, int nPeers, flagcxReg *regRecord,
+                                        flagcxP2pRegisterMode mode, int* regBufFlag,
+                                        uintptr_t* offsetOut, uintptr_t** peerRmtAddrsOut,
+                                        bool* isLegacyIpc) {
   flagcxResult_t ret = flagcxSuccess;
   *regBufFlag = 0;
   *offsetOut = 0;
@@ -492,17 +587,14 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
   int legacyIpcCap = 0;
   uintptr_t baseAddr = 0;
   uintptr_t baseSize = 0;
+  const bool allowRegister = (mode == flagcxP2pRegisterModeRegister);
   
   if (isLegacyIpc) *isLegacyIpc = false;
-  if (regRecord == NULL) {
-    INFO(FLAGCX_REG, "p2pRegisterBuffer skip: regRecord is NULL for buff %p size %zu", userbuff, buffsize);
-    return flagcxSuccess;
-  }
   flagcxRegItem *regItem = globalRegPool.getItem(comm, const_cast<void*>(userbuff));
-  if (regItem == NULL) {
+  if (regRecord == NULL || regItem == NULL) {
     INFO(FLAGCX_REG,
-         "p2pRegisterBuffer skip: no regItem found for buff %p size %zu regAddr %p",
-         userbuff, buffsize, (void*)regRecord->addr);
+         "p2pRegisterBuffer skip: regRecord=%p regItem=%p for buff %p size %zu",
+         regRecord, regItem, userbuff, buffsize);
     return flagcxSuccess;
   }
   INFO(FLAGCX_REG,
@@ -513,112 +605,180 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm, const void *user
   // int peerLocalRank = -1;
   for (int p = 0; p < nPeers; p++) {
     int peerRank = peerRanks[p];
-    // peerLocalRank = comm->rankToLocalRank[peerRank];
     
-    struct flagcxConnector *peerConn = peerConns[p];
-    if (peerConn == NULL) {
-      INFO(FLAGCX_REG, "rank %d - peer %d connector is NULL, skipping registration", comm ? comm->rank : -1, peerRank);
-      continue;
-    }
-    struct flagcxProxyConnector* peerProxyConn = &peerConn->proxyConn;
+    // struct flagcxConnector *peerConn = peerConns[p];
+    int peerLocalRank = comm->rankToLocalRank[peerRank];
     
-    bool found = false;
+    flagcxIpcRegInfo *existingInfo = NULL;
     for (auto &handlePair : regItem->handles) {
-      if (handlePair.second.proxyConn == peerProxyConn && handlePair.second.handle) {
-        flagcxIpcRegInfo *existingInfo = (flagcxIpcRegInfo*)handlePair.second.handle;
-        *regBufFlag = 1;
-        if (isLegacyIpc) *isLegacyIpc = existingInfo->impInfo.legacyIpcCap;
-        INFO(FLAGCX_REG, "rank %d - P2P reuse buffer %p size %zu to peer %d regAddr %p", 
-             comm->rank, userbuff, buffsize, peerRank, existingInfo->impInfo.rmtRegAddr);
-        found = true;
+      if (handlePair.second.proxyConn == &comm->gproxyConn[peerLocalRank] && handlePair.second.handle) {
+        existingInfo = (flagcxIpcRegInfo*)handlePair.second.handle;
         break;
       }
     }
-    
-    if (!found) {
-      // Register buffer with peerLocalRank
-      struct flagcxProxyConnector* proxyConn = peerProxyConn;
+
+    if (existingInfo && (!allowRegister)) {
+      // Sender already has a reg record but may still need to import the handle
+      if (existingInfo->handleReady && existingInfo->impInfo.rmtRegAddr) {
+        *regBufFlag = 1;
+        if (isLegacyIpc) *isLegacyIpc = existingInfo->impInfo.legacyIpcCap;
+        INFO(FLAGCX_REG, "rank %d - P2P reuse buffer %p size %zu to peer %d regAddr %p current mode %d", 
+             comm->rank, userbuff, buffsize, peerRank, existingInfo->impInfo.rmtRegAddr, mode);
+        continue;
+      }
+      // else: existingInfo exists but handleReady==false, need to do bootstrapRecv below
+    }
+
+    if (existingInfo && allowRegister) {
+      // Receiver already exported for this peer, nothing else to do
+      *regBufFlag = 1;
+      if (isLegacyIpc) *isLegacyIpc = existingInfo->impInfo.legacyIpcCap;
+      INFO(FLAGCX_REG, "rank %d - P2P reuse buffer %p size %zu to peer %d regAddr %p", 
+           comm->rank, userbuff, buffsize, peerRank, existingInfo->impInfo.rmtRegAddr);
+      continue;
+    }
+
+    // Either existingInfo is NULL, or it's sender with handleReady==false
+    {
+      struct flagcxProxyConnector *proxyConn = &comm->gproxyConn[peerLocalRank];
+      struct flagcxIpcRegInfo* newInfo = NULL;
+      
+      if (!allowRegister) {
+        // Lookup mode (sender): receive ipcInfo from peer, open handle
+        INFO(FLAGCX_REG, "rank %d - IPC lookup buffer %p size %zu for peer %d via bootstrap", 
+             comm->rank, userbuff, buffsize, peerRank);
+        
+        struct p2pIpcExpInfo recvIpcInfo;
+        memset(&recvIpcInfo, 0, sizeof(p2pIpcExpInfo));
+        void* rmtRegAddr = NULL;
+        
+        // Receive ipcInfo from peer (tag = 4000 + comm->rank, receiver sends using our rank)
+        FLAGCXCHECKGOTO(bootstrapRecv(comm->bootstrap, peerRank, 4000 + comm->rank, 
+                                       &recvIpcInfo, sizeof(p2pIpcExpInfo)), ret, fail);
+        
+        // Open handle in our device context
+        deviceAdaptor->setDevice(comm->cudaDev);
+        if (recvIpcInfo.legacyIpcCap) {
+          flagcxIpcMemHandle_t ipcHandle = (flagcxIpcMemHandle_t)&recvIpcInfo.ipcDesc.handleData;
+          FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleOpen(ipcHandle, &rmtRegAddr), ret, fail);
+          if (rmtRegAddr) {
+            rmtRegAddr = (void *)((uintptr_t)rmtRegAddr + recvIpcInfo.offset);
+          }
+        } else {
+          WARN("rank %d - Non-legacy IPC not fully implemented yet for peer %d",
+               comm->rank, peerRank);
+          goto fail;
+        }
+        
+        if (!existingInfo) {
+          newInfo = (flagcxIpcRegInfo*)calloc(1, sizeof(flagcxIpcRegInfo));
+          if (newInfo == NULL) {
+            WARN("Failed to allocate IPC registration info");
+            goto fail;
+          }
+          newInfo->peerRank = peerRank;
+          newInfo->baseAddr = NULL;
+          newInfo->ipcProxyconn = NULL;  // Not using proxy for P2P IPC
+          FLAGCXCHECKGOTO(globalRegPool.addP2pHandle(comm, regItem, newInfo, proxyConn), ret, fail);
+          existingInfo = newInfo;
+        }
+
+        if (rmtRegAddr) {
+          existingInfo->impInfo.rmtRegAddr = rmtRegAddr;
+          existingInfo->impInfo.offset = recvIpcInfo.offset;
+          existingInfo->impInfo.legacyIpcCap = recvIpcInfo.legacyIpcCap;
+          existingInfo->handleReady = true;
+          regRecord->state |= IPC_REG_COMPLETE;
+          *regBufFlag = 1;
+          INFO(FLAGCX_REG, "rank %d - IPC lookup completed buffer %p size %zu for peer %d regAddr %p", 
+               comm->rank, userbuff, buffsize, peerRank, rmtRegAddr);
+        }
+        continue;
+      }
+      
+      // Register mode (receiver): get IPC handle and send to peer
       struct p2pIpcExpInfo ipcInfo;
       memset(&ipcInfo, 0, sizeof(p2pIpcExpInfo));
-      struct flagcxIpcRegInfo* newInfo = NULL;
 
       if (baseAddr == 0) {
-        // Get page-aligned base address and size
-        globalRegPool.getPagedAddr(const_cast<void*>(userbuff), buffsize, &baseAddr, &baseSize);
+        uintptr_t beginAddr = 0;
+        uintptr_t endAddr = 0;
+        if (regRecord->baseAddr && regRecord->baseSize) {
+          beginAddr = regRecord->baseAddr;
+          endAddr = regRecord->baseAddr + regRecord->baseSize;
+        } else {
+          globalRegPool.getPagedAddr(const_cast<void*>(userbuff), buffsize, &beginAddr, &endAddr);
+        }
+        baseAddr = beginAddr;
+        baseSize = endAddr - beginAddr;
         legacyIpcCap = 1;
         INFO(FLAGCX_REG,
-             "rank %d - computed paged base addr %p size %zu for buff %p",
-             comm ? comm->rank : -1, (void*)baseAddr, baseSize, userbuff);
+             "rank %d - computed register range base=%p size=%zu user=%p regAddr=%p",
+             comm->rank, (void *)baseAddr, (size_t)baseSize,
+             userbuff, (void *)regRecord->addr);
       }
       
       if (legacyIpcCap) {
-        // legacy CUDA IPC export
+        // Get IPC handle
         flagcxIpcMemHandle_t ipcHandle = NULL;
         size_t handleSize = 0;
-        
         FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleCreate(&ipcHandle, &handleSize), ret, fail);
         FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleGet(ipcHandle, (void*)baseAddr), ret, fail);
-        
-        // Copy IPC handle data
         if (handleSize <= sizeof(flagcxIpcHandleData)) {
           memcpy(&ipcInfo.ipcDesc.handleData, ipcHandle, handleSize);
         }
-        
         deviceAdaptor->ipcMemHandleFree(ipcHandle);
         
         ipcInfo.legacyIpcCap = true;
         if (isLegacyIpc) *isLegacyIpc = true;
       } else {
-        // cuMem or other advanced IPC mechanism not supported yet
-           WARN("rank %d - Non-legacy IPC not fully implemented yet for peer %d",
-             comm ? comm->rank : -1, peerRank);
+        WARN("rank %d - Non-legacy IPC not fully implemented yet for peer %d",
+             comm->rank, peerRank);
         goto fail;
       }
       
-      void* rmtRegAddr = NULL;
-      ipcInfo.size = baseSize;
+      ipcInfo.size = (size_t)baseSize;
       ipcInfo.offset = regRecord->addr - baseAddr;
       
-      // Register buffer on proxy side and get the remote register address back
-      if (proxyConn) {
-        INFO(FLAGCX_REG, "rank %d - IPC registering buffer %p size %zu (baseAddr %p size %zu) to peer %d", 
-             comm->rank, userbuff, buffsize, (void*)regRecord->addr, ipcInfo.size, peerRank);
-        
-        FLAGCXCHECKGOTO(flagcxProxyCallBlocking(comm, proxyConn, flagcxProxyMsgRegister, 
-                                                 &ipcInfo, sizeof(p2pIpcExpInfo), 
-                                                 &rmtRegAddr, sizeof(void*)), ret, fail);
+      // Send ipcInfo to sender via bootstrap
+      INFO(FLAGCX_REG, "rank %d - IPC registering buffer %p size %zu (baseAddr %p size %zu) to peer %d via bootstrap", 
+           comm->rank, userbuff, buffsize, (void*)regRecord->addr, ipcInfo.size, peerRank);
+      // Tag = 4000 + peerRank (sender will recv using its own rank)
+      FLAGCXCHECKGOTO(bootstrapSend(comm->bootstrap, peerRank, 4000 + peerRank, 
+                                     &ipcInfo, sizeof(p2pIpcExpInfo)), ret, fail);
+      
+      // Save receiver's buffer info
+      if (!existingInfo) {
+        newInfo = (flagcxIpcRegInfo*)calloc(1, sizeof(flagcxIpcRegInfo));
+      } else {
+        newInfo = existingInfo;
+      }
+      if (newInfo == NULL) {
+        WARN("Failed to allocate IPC registration info");
+        goto fail;
       }
       
-      if (rmtRegAddr) {
-        // Allocate new IPC registration info
-        newInfo = (flagcxIpcRegInfo*)malloc(sizeof(flagcxIpcRegInfo));
-        if (newInfo == NULL) {
-          WARN("Failed to allocate IPC registration info");
-          goto fail;
-        }
-        
-        regRecord->state |= IPC_REG_COMPLETE;
-        newInfo->peerRank = peerRank;
-        newInfo->baseAddr = (void*)baseAddr;
-        newInfo->impInfo.rmtRegAddr = rmtRegAddr;
-        newInfo->impInfo.offset = ipcInfo.offset;
-        newInfo->impInfo.legacyIpcCap = ipcInfo.legacyIpcCap;
-        newInfo->ipcProxyconn = proxyConn;
-        FLAGCXCHECKGOTO(globalRegPool.addP2pHandle(comm, regItem, newInfo, proxyConn), ret, fail);
-        
-        *regBufFlag = 1;
-        
-        INFO(FLAGCX_REG, "rank %d - P2P registered buffer %p size %zu (baseAddr %p size %zu) to peer %d regAddr %p offsetOut %zu", 
-             comm->rank, userbuff, buffsize, (void*)regRecord->addr, ipcInfo.size, peerRank, 
-             rmtRegAddr, (uintptr_t)userbuff - regRecord->addr);
-      }
+      regRecord->state |= IPC_REG_COMPLETE;
+      newInfo->peerRank = peerRank;
+      newInfo->baseAddr = (void*)baseAddr;
+      newInfo->impInfo.rmtRegAddr = NULL; // Receiver waits for sender import
+      newInfo->impInfo.offset = ipcInfo.offset;
+      newInfo->impInfo.legacyIpcCap = ipcInfo.legacyIpcCap;
+      newInfo->ipcProxyconn = NULL;  // Not using proxy for P2P IPC
+      newInfo->handleReady = false;
+      FLAGCXCHECKGOTO(globalRegPool.addP2pHandle(comm, regItem, newInfo, proxyConn), ret, fail);
+      
+      *regBufFlag = 1;
+      
+      INFO(FLAGCX_REG, "rank %d - IPC registered buffer %p size %zu (baseAddr %p) to peer %d", 
+           comm->rank, userbuff, buffsize, (void*)regRecord->addr, peerRank);
     }
   }
   
   if (*regBufFlag) {
     assert(nPeers == 1);
     // p2p always returns remote addr here since remote buffer addr is passed in device work struct
-    struct flagcxProxyConnector* targetProxyConn = &peerConns[0]->proxyConn;
+    struct flagcxProxyConnector* targetProxyConn = &comm->gproxyConn[comm->rankToLocalRank[peerRanks[0]]];
     for (auto &handlePair : regItem->handles) {
       if (handlePair.second.proxyConn == targetProxyConn && handlePair.second.handle) {
         flagcxIpcRegInfo *info = (flagcxIpcRegInfo*)handlePair.second.handle;
@@ -642,7 +802,9 @@ fail:
 flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        const void *userbuff, size_t buffSize,
                                        struct flagcxConnector **peerConns,
-                                       int *peerRanks, int nPeers, int *regBufFlag,
+                                       int *peerRanks, int nPeers,
+                                       flagcxP2pRegisterMode mode,
+                                       int *regBufFlag,
                                        uintptr_t *offsetOut, uintptr_t **peerRmtAddrsOut) {
   flagcxReg tempReg = {};
   struct flagcxReg *regRecord = NULL;
@@ -651,8 +813,8 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
   *peerRmtAddrsOut = NULL;
   if (comm && userbuff && buffSize > 0 && nPeers > 0) {
     INFO(FLAGCX_REG,
-         "flagcxP2pRegisterBuffer enter: comm=%p rank=%d buff=%p size=%zu nPeers=%d",
-         comm, comm->rank, userbuff, buffSize, nPeers);
+         "flagcxP2pRegisterBuffer enter: comm=%p rank=%d buff=%p size=%zu nPeers=%d mode=%d",
+         comm, comm->rank, userbuff, buffSize, nPeers, (int)mode);
     flagcxRegItem *regItem =
         globalRegPool.getItem(comm, const_cast<void *>(userbuff));
     if (regItem != NULL) {
@@ -664,8 +826,9 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
     } else {
       INFO(FLAGCX_REG, "flagcxP2pRegisterBuffer: no regItem for buff %p size %zu", userbuff, buffSize);
     }
-    FLAGCXCHECK(p2pRegisterBuffer(comm, userbuff, buffSize, peerConns, peerRanks, nPeers, regRecord, 
-                                  regBufFlag, offsetOut, peerRmtAddrsOut, NULL));
+    FLAGCXCHECK(p2pRegisterBuffer(comm, userbuff, buffSize, peerConns, peerRanks,
+                    nPeers, regRecord, mode, regBufFlag, offsetOut,
+                    peerRmtAddrsOut, NULL));
     INFO(FLAGCX_REG,
          "flagcxP2pRegisterBuffer exit: buff=%p regBufFlag=%d offset=%zu peerAddr=%p",
          userbuff, *regBufFlag, *offsetOut,
@@ -685,117 +848,135 @@ flagcxResult_t flagcxP2pDeregisterBuffer(struct flagcxHeteroComm *comm,
   }
   INFO(FLAGCX_REG, "P2P deregister buffer: comm=%p peerRank=%d rmtRegAddr=%p offset=%zu legacyIpcCap=%d",
        comm, info->peerRank, info->impInfo.rmtRegAddr, info->impInfo.offset, info->impInfo.legacyIpcCap);
-  if (info->ipcProxyconn) {
-    flagcxIpcImpInfo deregInfo;
-    deregInfo.rmtRegAddr = info->impInfo.rmtRegAddr;
-    deregInfo.offset = info->impInfo.offset;
-    deregInfo.legacyIpcCap = info->impInfo.legacyIpcCap;
-    
-    FLAGCXCHECK(flagcxProxyCallBlocking(comm, info->ipcProxyconn, 
-                                        flagcxProxyMsgDeregister,
-                                        &deregInfo, sizeof(flagcxIpcImpInfo),
-                                        NULL, 0));
-    
-    INFO(FLAGCX_REG, "P2P deregister buffer success: peerRank=%d rmtRegAddr=%p",
-         info->peerRank, info->impInfo.rmtRegAddr);
+  
+  // Close IPC handle if opened (sender side)
+  if (info->impInfo.rmtRegAddr && info->impInfo.legacyIpcCap) {
+    // Need to close the IPC memory handle that was opened
+    void* baseAddr = (void*)((uintptr_t)info->impInfo.rmtRegAddr - info->impInfo.offset);
+    deviceAdaptor->ipcMemHandleClose(baseAddr);
+    INFO(FLAGCX_REG, "P2P deregister: closed IPC handle for rmtRegAddr=%p baseAddr=%p",
+         info->impInfo.rmtRegAddr, baseAddr);
   }
   free(info);
   
   return flagcxSuccess;
 }
 
-static flagcxResult_t flagcxP2pProxyRegister(struct flagcxProxyConnection* connection, 
-                                              struct flagcxProxyState* proxyState, 
-                                              void* reqBuff, int reqSize, 
-                                              void* respBuff, int respSize, int* done) {
-  struct p2pIpcExpInfo* ipcExpInfo = (struct p2pIpcExpInfo*)reqBuff;
-  void* regAddr = NULL;
-  flagcxResult_t ret = flagcxSuccess;
+// flagcxResult_t flagcxP2pProxyRegister(struct flagcxProxyConnection* connection,
+//                                       struct flagcxProxyState* proxyState,
+//                                       void* reqBuff, int reqSize, 
+//                                       void* respBuff, int respSize, int* done) {
+//   struct p2pIpcExpInfo* ipcExpInfo = (struct p2pIpcExpInfo*)reqBuff;
+//   void* regAddr = NULL;
+//   flagcxResult_t ret = flagcxSuccess;
 
-  if (sizeof(struct p2pIpcExpInfo) != reqSize) {
-    WARN("Invalid request size for P2P proxy register: expected %zu, got %d", 
-         sizeof(struct p2pIpcExpInfo), reqSize);
-    *done = 1;
-    return flagcxInvalidArgument;
-  }
-  
-  if (sizeof(void*) != respSize) {
-    WARN("Invalid response size for P2P proxy register: expected %zu, got %d", 
-         sizeof(void*), respSize);
-    *done = 1;
-    return flagcxInvalidArgument;
-  }
+//   if (proxyState == NULL) {
+//     WARN("Proxy register missing state context");
+//     *done = 1;
+//     return flagcxInvalidArgument;
+//   }
+//   INFO(FLAGCX_REG, "Proxy rank %d register reqBuff %p size %ld offset %ld legacyIpcCap %d sameProcess %d", proxyState->cudaDev, reqBuff, ipcExpInfo->size, ipcExpInfo->offset, ipcExpInfo->legacyIpcCap, connection->sameProcess);
+//   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(proxyState->cudaDev), ret, exit);
 
-  INFO(FLAGCX_REG, "Proxy rank %d register buffer size %zu offset %zu legacyIpcCap %d sameProcess %d", 
-       proxyState->tpRank, ipcExpInfo->size, ipcExpInfo->offset, 
-       ipcExpInfo->legacyIpcCap, connection->sameProcess);
+//   if (sizeof(struct p2pIpcExpInfo) != reqSize) {
+//     WARN("Invalid request size for P2P proxy register: expected %zu, got %d", 
+//          sizeof(struct p2pIpcExpInfo), reqSize);
+//     *done = 1;
+//     return flagcxInvalidArgument;
+//   }
+  
+//   if (sizeof(void*) != respSize) {
+//     WARN("Invalid response size for P2P proxy register: expected %zu, got %d", 
+//          sizeof(void*), respSize);
+//     *done = 1;
+//     return flagcxInvalidArgument;
+//   }
 
-  // Request peer passes all necessary buffer info to import. The proxy thread would register
-  // the buffer locally and return register addr back
-  if (ipcExpInfo->legacyIpcCap) {
-    // Legacy CUDA IPC import
-    flagcxIpcMemHandle_t ipcHandle = (flagcxIpcMemHandle_t)&ipcExpInfo->ipcDesc.handleData;
-    
-    FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleOpen(ipcHandle, &regAddr), ret, fail);
-    if (regAddr == NULL) {
-      WARN("Failed to open IPC handle");
-      goto fail;
-    }
-    regAddr = (void*)((uintptr_t)regAddr + ipcExpInfo->offset);
-  } else {
-    // cuMem or advanced IPC import not fully supported yet
-    WARN("Non-legacy IPC import not implemented in proxy");
-    goto fail;
-  }
-  
-  INFO(FLAGCX_REG, "Proxy rank %d register success regAddr %p size %zu offset %zu legacyIpcCap %d sameProcess %d", 
-       proxyState->tpRank, regAddr, ipcExpInfo->size, ipcExpInfo->offset, 
-       ipcExpInfo->legacyIpcCap, connection->sameProcess);
+//   // Request peer passes all necessary buffer info to import. The proxy thread would register
+//   // the buffer locally and return register addr back
+//   if (ipcExpInfo->legacyIpcCap) {
+//     if (connection->sameProcess) {
+//       void *baseAddr = NULL;
+//       memcpy(&baseAddr, &ipcExpInfo->ipcDesc.handleData, sizeof(void *));
+//       regAddr = (void *)((uintptr_t)baseAddr + ipcExpInfo->offset);
+//     } else {
+//       // Legacy CUDA IPC import
+//       flagcxIpcMemHandle_t ipcHandle =
+//           (flagcxIpcMemHandle_t)&ipcExpInfo->ipcDesc.handleData;
 
-exit:
-  memcpy(respBuff, (void*)&regAddr, sizeof(void*));
-  *done = 1;
-  return ret;
-  
-fail:
-  regAddr = NULL;
-  goto exit;
-}
+//       flagcxResult_t openRes =
+//           deviceAdaptor->ipcMemHandleOpen(ipcHandle, &regAddr);
+//       if (openRes != flagcxSuccess) {
+//         WARN("ipcMemHandleOpen failed: res=%d size=%zu offset=%zu legacyIpc=%d",
+//              static_cast<int>(openRes), ipcExpInfo->size, ipcExpInfo->offset,
+//              ipcExpInfo->legacyIpcCap);
+//         ret = openRes;
+//         goto fail;
+//       }
+//       if (regAddr == NULL) {
+//         WARN("ipcMemHandleOpen returned NULL ptr size=%zu offset=%zu "
+//              "legacyIpc=%d",
+//              ipcExpInfo->size, ipcExpInfo->offset, ipcExpInfo->legacyIpcCap);
+//         goto fail;
+//       }
+//       regAddr = (void *)((uintptr_t)regAddr + ipcExpInfo->offset);
+//     }
+//   } else {
+//     // cuMem or advanced IPC import not fully supported yet
+//     WARN("Non-legacy IPC import not implemented in proxy");
+//     goto fail;
+//   }
+//   INFO(FLAGCX_REG, "Proxy register success regAddr %p size %zu offset %zu legacyIpcCap %d sameProcess %d", 
+//        regAddr, ipcExpInfo->size, ipcExpInfo->offset, 
+//        ipcExpInfo->legacyIpcCap, connection->sameProcess);
 
-static flagcxResult_t flagcxP2pProxyDeregister(struct flagcxProxyConnection* connection, 
-                                                struct flagcxProxyState* proxyState, 
-                                                void* reqBuff, int reqSize, int* done) {
-  flagcxResult_t ret = flagcxSuccess;
-  struct flagcxIpcImpInfo* ipcInfo = (struct flagcxIpcImpInfo*)reqBuff;
+// exit:
+//   memcpy(respBuff, (void*)&regAddr, sizeof(void*));
+//   *done = 1;
+//   return ret;
   
-  if (sizeof(struct flagcxIpcImpInfo) != reqSize) {
-    WARN("Invalid request size for P2P proxy deregister: expected %zu, got %d", 
-         sizeof(struct flagcxIpcImpInfo), reqSize);
-    *done = 1;
-    return flagcxInvalidArgument;
-  }
+// fail:
+//   regAddr = NULL;
+//   goto exit;
+// }
 
-  void* baseAddr = (void*)((uintptr_t)ipcInfo->rmtRegAddr - ipcInfo->offset);
+// flagcxResult_t flagcxP2pProxyDeregister(struct flagcxProxyConnection* connection,
+//   void* reqBuff, int reqSize, int* done) {
+//                                           // struct flagcxProxyState* proxyState,  
+//   flagcxResult_t ret = flagcxSuccess;
+//   struct flagcxIpcImpInfo* ipcInfo = (struct flagcxIpcImpInfo*)reqBuff;
   
-  if (ipcInfo->legacyIpcCap) {
-    // Legacy CUDA IPC close
-    FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleClose(baseAddr), ret, fail);
-  } else {
-    // cuMem or advanced IPC deallocation not fully supported yet
-    WARN("Non-legacy IPC deregister not implemented in proxy");
-    goto fail;
-  }
-  
-  INFO(FLAGCX_REG, "Proxy rank %d deregister success addr %p offset %zu legacyIpcCap %d", 
-       proxyState->tpRank, ipcInfo->rmtRegAddr, ipcInfo->offset, ipcInfo->legacyIpcCap);
+//   // if (proxyState == NULL) {
+//   //   WARN("Proxy deregister missing state context");
+//   //   *done = 1;
+//   //   return flagcxInvalidArgument;
+//   // }
+//   // deviceAdaptor->setDevice(proxyState->cudaDev);
 
-exit:
-  *done = 1;
-  return ret;
+//   if (sizeof(struct flagcxIpcImpInfo) != reqSize) {
+//     WARN("Invalid request size for P2P proxy deregister: expected %zu, got %d", 
+//          sizeof(struct flagcxIpcImpInfo), reqSize);
+//     *done = 1;
+//     return flagcxInvalidArgument;
+//   }
+
+//   void* baseAddr = (void*)((uintptr_t)ipcInfo->rmtRegAddr - ipcInfo->offset);
   
-fail:
-  goto exit;
-}
+//   if (ipcInfo->legacyIpcCap) {
+//     // Legacy CUDA IPC close
+//     FLAGCXCHECKGOTO(deviceAdaptor->ipcMemHandleClose(baseAddr), ret, fail);
+//   } else {
+//     // cuMem or advanced IPC deallocation not fully supported yet
+//     WARN("Non-legacy IPC deregister not implemented in proxy");
+//     goto fail;
+//   }
+// exit:
+//   *done = 1;
+//   return ret;
+  
+// fail:
+//   goto exit;
+// }
 
 flagcxResult_t flagcxP2pSendProxyFree(struct flagcxP2pResources *resources) {
   if (resources == NULL)

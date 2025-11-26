@@ -284,6 +284,7 @@ struct flagcxHeteroComm {
   uint64_t intraBarrierGate; // only used if this is intraComm0
 
   struct flagcxProxyState *proxyState;
+  struct flagcxProxyConnector gproxyConn[FLAGCX_MAX_LOCAL_RANKS];
   int proxyRefCountOld; /* store proxy post-atomic-sub refcount */
   // Whether this communicator uses collNet
   int collNetSupport;

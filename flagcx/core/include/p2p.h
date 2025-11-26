@@ -61,9 +61,6 @@ struct flagcxP2pSyncSlot {
 struct p2pRegInfo {
   int copyDone;          // Indicates if the copy operation is complete
   int copyStarted;       // Indicates if the copy operation has started
-  int receiverReady;     // Indicates if the receiver is ready to receive data
-  void* receiverRegAddr; // Address of the receiver's registered memory (shared)
-  ssize_t receiverRegBytes; // Size of the registered memory region
 };
 
 struct flagcxP2pShm {
@@ -93,6 +90,11 @@ struct flagcxP2pResources {
   // Proxy info for async operations
   struct flagcxP2pShmProxyInfo proxyInfo;
 };
+
+typedef enum {
+  flagcxP2pRegisterModeLookup = 0,
+  flagcxP2pRegisterModeRegister = 1,
+} flagcxP2pRegisterMode;
 
 flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
                                   void *data, size_t size,
@@ -127,6 +129,17 @@ flagcxP2pRecvProxyConnect(struct flagcxProxyConnection *connection,
                           struct flagcxProxyState *proxyState, void *reqBuff,
                           int reqSize, void *respBuff, int respSize, int *done);
 
+flagcxResult_t flagcxP2pProxyRegister(struct flagcxProxyConnection *connection,
+                                      struct flagcxProxyState *proxyState,
+                                      void *reqBuff, int reqSize,
+                                      void *respBuff, int respSize,
+                                      int *done);
+
+flagcxResult_t flagcxP2pProxyDeregister(struct flagcxProxyConnection *connection,
+                                        struct flagcxProxyState *proxyState,
+                                        void *reqBuff, int reqSize,
+                                        int *done);
+
 flagcxResult_t
 flagcxP2pAllocateShareableBuffer(size_t size, int directMap,
                                  struct flagcxP2pIpcDesc *ipcDesc, void **ptr);
@@ -140,6 +153,7 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        const void *userbuff, size_t buffSize,
                                        struct flagcxConnector **peerConns,
                                        int *peerRanks, int nPeers,
+                                       flagcxP2pRegisterMode mode,
                                        int *regBufFlag,
                                        uintptr_t *offsetOut, 
                                        uintptr_t **peerRmtAddrsOut);
