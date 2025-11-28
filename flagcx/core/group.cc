@@ -195,23 +195,18 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                          peer, comm->rank, op->args.p2pPeerSlotIdx,
                          op->args.p2pPeerOpHash);
 
-              flagcxConnector *recvConn = &comm->channels[op->channelId]
-                                            .peers[peer]
-                                            ->recv[0];
+              flagcxConnector *recvConn =
+                  &comm->channels[op->channelId].peers[peer]->recv[0];
               flagcxConnector *peerConns[] = {recvConn};
               int peerRanks[] = {peer};
               uintptr_t regOffset = 0;
               uintptr_t *peerRmtAddr = NULL;
               op->args.regBufFlag = 0;
-              flagcxResult_t res = flagcxP2pRegisterBuffer(
-                comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
-                flagcxP2pRegisterModeRegister, &op->args.regBufFlag,
-                &regOffset, &peerRmtAddr);
-              if (res != flagcxSuccess) {
-                WARN("P2P register failed … res=%d", res);
-                op->args.regBufFlag = 0;
-              }
-              if (!op->args.regBufFlag) {
+              FLAGCXCHECK(flagcxP2pRegisterBuffer(
+                  comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
+                  flagcxP2pRegisterModeRegister, &op->args.regBufFlag,
+                  &regOffset, &peerRmtAddr));
+              if (op->args.regBufFlag) {
                 INFO(FLAGCX_REG,
                      "flagcxGroup P2P recv reg rank %d <- %d buff %p size %zu "
                      "offset %zu remote %p",
@@ -291,19 +286,20 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                          "opHash(%d)]",
                          comm->rank, peer, op->args.p2pSlotIdx,
                          op->args.p2pOpHash);
-              TRACE_CALL("Sender: [peerRank(%d), rank(%d)] -> [peerSlotIdx(%ld), "
-                         "peerOpHash(%d)]",
-                         peer, comm->rank, op->args.p2pPeerSlotIdx,
-                         op->args.p2pPeerOpHash);
+              TRACE_CALL(
+                  "Sender: [peerRank(%d), rank(%d)] -> [peerSlotIdx(%ld), "
+                  "peerOpHash(%d)]",
+                  peer, comm->rank, op->args.p2pPeerSlotIdx,
+                  op->args.p2pPeerOpHash);
               flagcxConnector *peerConns[] = {
-                    comm->channels[op->channelId].peers[peer]->send};
+                  comm->channels[op->channelId].peers[peer]->send};
               int peerRanks[] = {peer};
               uintptr_t regOffset = 0;
               uintptr_t *peerRmtAddr = NULL;
-              flagcxP2pRegisterBuffer(
-                    comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
-                    flagcxP2pRegisterModeLookup, &op->args.regBufFlag,
-                    &regOffset, &peerRmtAddr);
+              FLAGCXCHECK(flagcxP2pRegisterBuffer(
+                  comm, p2p->buff, p2p->bytes, peerConns, peerRanks, 1,
+                  flagcxP2pRegisterModeLookup, &op->args.regBufFlag, &regOffset,
+                  &peerRmtAddr));
               // Pass the remote address to sender for zero-copy
               // peerRmtAddr is the remote address itself (cast as uintptr_t*)
               if (op->args.regBufFlag && peerRmtAddr) {

@@ -680,9 +680,6 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           "op->reqSize=%d, op->respSize=%d",
           op->opId, op->reqBuff, op->reqSize, op->respSize);
     if (op->connection->transport == TRANSPORT_P2P) {
-      // FLAGCXCHECK(flagcxP2pProxyRegister(op->connection, op->proxyState,
-      //                op->reqBuff, op->reqSize,
-      //                op->respBuff, op->respSize, &done));
       ;
     } else if (op->connection->transport == TRANSPORT_NET) {
       void *handle;
@@ -698,8 +695,8 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           FLAGCXCHECK(deviceAdaptor->getHandleForAddressRange(
               (void *)&dmabuf_fd, (void *)info->buffer, info->size, 0));
           FLAGCXCHECK(resources->netAdaptor->regMrDmaBuf(
-              resources->netSendComm, (void *)info->buffer, info->size, 2,
-              0ULL, dmabuf_fd, &handle));
+              resources->netSendComm, (void *)info->buffer, info->size, 2, 0ULL,
+              dmabuf_fd, &handle));
           (void)close(dmabuf_fd);
         } else {
           FLAGCXCHECK(resources->netAdaptor->regMr(resources->netSendComm,
@@ -715,8 +712,8 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           FLAGCXCHECK(deviceAdaptor->getHandleForAddressRange(
               (void *)&dmabuf_fd, (void *)info->buffer, info->size, 0));
           FLAGCXCHECK(resources->netAdaptor->regMrDmaBuf(
-              resources->netRecvComm, (void *)info->buffer, info->size, 2,
-              0ULL, dmabuf_fd, &handle));
+              resources->netRecvComm, (void *)info->buffer, info->size, 2, 0ULL,
+              dmabuf_fd, &handle));
           (void)close(dmabuf_fd);
         } else {
           FLAGCXCHECK(resources->netAdaptor->regMr(resources->netRecvComm,
@@ -733,8 +730,6 @@ static flagcxResult_t proxyProgressAsync(flagcxProxyAsyncOp **opHead,
           "op->reqSize=%d, op->respSize=%d",
           op->opId, op->reqBuff, op->reqSize, op->respSize);
     if (op->connection->transport == TRANSPORT_P2P) {
-      // FLAGCXCHECK(flagcxP2pProxyDeregister(op->connection, op->proxyState,
-      //              op->reqBuff, op->reqSize, &done));
       ;
     } else if (op->connection->transport == TRANSPORT_NET) {
       void *handle;

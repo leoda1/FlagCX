@@ -30,20 +30,20 @@ struct flagcxRegP2pHandle {
 };
 
 struct flagcxIpcImpInfo {
-  void* rmtRegAddr;
+  void *rmtRegAddr;
   bool legacyIpcCap;
   uintptr_t offset;
 };
 
 struct flagcxPeerRegIpcAddr {
-  uintptr_t* devPeerRmtAddrs;
-  uintptr_t* hostPeerRmtAddrs;
+  uintptr_t *devPeerRmtAddrs;
+  uintptr_t *hostPeerRmtAddrs;
 };
 
 struct flagcxIpcRegInfo {
   int peerRank;
-  void* baseAddr;
-  struct flagcxProxyConnector* ipcProxyconn;
+  void *baseAddr;
+  struct flagcxProxyConnector *ipcProxyconn;
   struct flagcxIpcImpInfo impInfo;
   bool handleReady;
 };
@@ -73,9 +73,6 @@ struct flagcxReg {
   // collnet reg
   void *collnetHandle;
   struct flagcxProxyConnector *proxyconn;
-  // general ipc reg
-  struct flagcxPeerRegIpcAddr regIpcAddrs;
-  struct flagcxIpcRegInfo* ipcInfos[FLAGCX_MAX_LOCAL_RANKS];
 };
 
 struct flagcxRegCache {

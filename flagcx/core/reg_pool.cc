@@ -1,6 +1,6 @@
 #include "reg_pool.h"
-#include "proxy.h"
 #include "p2p.h"
+#include "proxy.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -21,9 +21,9 @@ inline void flagcxRegPool::getPagedAddr(void *data, size_t length,
       (reinterpret_cast<uintptr_t>(data) + length + pageSize - 1) & -pageSize;
 }
 
-flagcxResult_t flagcxRegPool::addNetHandle(void *comm, flagcxRegItem *reg,
-                                           void *handle,
-                                           struct flagcxProxyConnector *proxyConn) {
+flagcxResult_t
+flagcxRegPool::addNetHandle(void *comm, flagcxRegItem *reg, void *handle,
+                            struct flagcxProxyConnector *proxyConn) {
   if (comm == nullptr || reg == nullptr) {
     return flagcxSuccess;
   }
@@ -36,13 +36,13 @@ flagcxResult_t flagcxRegPool::addNetHandle(void *comm, flagcxRegItem *reg,
   flagcxRegNetHandle netHandle{handle, proxyConn};
   flagcxRegP2pHandle p2pHandle{nullptr, nullptr};
   reg->handles.push_back(std::make_pair(netHandle, p2pHandle));
-  
+
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxRegPool::addP2pHandle(void *comm, flagcxRegItem *reg,
-                                           void *handle,
-                                           struct flagcxProxyConnector *proxyConn) {
+flagcxResult_t
+flagcxRegPool::addP2pHandle(void *comm, flagcxRegItem *reg, void *handle,
+                            struct flagcxProxyConnector *proxyConn) {
   if (comm == nullptr || reg == nullptr) {
     return flagcxSuccess;
   }
@@ -55,7 +55,7 @@ flagcxResult_t flagcxRegPool::addP2pHandle(void *comm, flagcxRegItem *reg,
   flagcxRegNetHandle netHandle{nullptr, nullptr};
   flagcxRegP2pHandle p2pHandle{handle, proxyConn};
   reg->handles.push_back(std::make_pair(netHandle, p2pHandle));
-  
+
   return flagcxSuccess;
 }
 
@@ -67,7 +67,8 @@ flagcxResult_t flagcxRegPool::removeRegItemNetHandles(void *comm,
 
   for (auto it = reg->handles.begin(); it != reg->handles.end();) {
     if (it->first.handle) {
-      FLAGCXCHECK(flagcxNetDeregisterBuffer(comm, it->first.proxyConn, it->first.handle));
+      FLAGCXCHECK(flagcxNetDeregisterBuffer(comm, it->first.proxyConn,
+                                            it->first.handle));
       it->first.handle = nullptr;
       it->first.proxyConn = nullptr;
     }

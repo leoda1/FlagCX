@@ -43,13 +43,16 @@ int main(int argc, char *argv[]) {
   flagcxStream_t stream;
   devHandle->streamCreate(&stream);
 
-  void *sendbuff, *recvbuff, *hello;
-  void *sendHandle, *recvHandle;
+  void *sendbuff = nullptr;
+  void *recvbuff = nullptr;
+  void *hello = nullptr;
+  void *sendHandle = nullptr;
+  void *recvHandle = nullptr;
   size_t count;
   timer tim;
   int recvPeer = (proc - 1 + totalProcs) % totalProcs;
   int sendPeer = (proc + 1) % totalProcs;
-
+  local_register = 1;
   if (local_register) {
     // allocate buffer
     flagcxMemAlloc(&sendbuff, max_bytes);

@@ -386,8 +386,8 @@ static flagcxResult_t netRegisterBuffer(flagcxHeteroComm *comm,
       if (peerConn == NULL)
         continue;
       peerProxyConn = &peerConn->proxyConn;
-      for (auto it = regRecord->handles.begin();
-           it != regRecord->handles.end(); it++) {
+      for (auto it = regRecord->handles.begin(); it != regRecord->handles.end();
+           it++) {
         if (it->first.proxyConn == peerProxyConn && it->first.handle) {
           found = true;
           outHandle[p] = it->first.handle;
@@ -408,7 +408,8 @@ static flagcxResult_t netRegisterBuffer(flagcxHeteroComm *comm,
             (flagcxHeteroComm *)comm, peerProxyConn, flagcxProxyMsgRegister,
             &info, sizeof(struct netRegInfo), &handle, sizeof(void *)));
         if (handle) {
-          FLAGCXCHECK(globalRegPool.addNetHandle(comm, regRecord, handle, peerProxyConn));
+          FLAGCXCHECK(globalRegPool.addNetHandle(comm, regRecord, handle,
+                                                 peerProxyConn));
           outHandle[p] = handle;
           *outRegBufFlag = 1;
           INFO(FLAGCX_REG,

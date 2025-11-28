@@ -2,7 +2,7 @@
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
  *
  * See LICENSE.txt for license information
-************************************************************************/
+ ************************************************************************/
 
 #include "adaptor.h"
 #include "bootstrap.h"
@@ -174,13 +174,6 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
     FLAGCXCHECK(flagcxCalloc(&comm->connectSend, nranks));
     FLAGCXCHECK(flagcxCalloc(&comm->connectRecv, nranks));
     FLAGCXCHECK(flagcxCalloc(&comm->proxyState, 1));
-    FLAGCXCHECK(flagcxCalloc(&comm->sharedRes, 1));
-    comm->sharedRes->owner = comm;
-    comm->sharedRes->tpNRanks = comm->nRanks;
-    FLAGCXCHECK(flagcxCalloc(&comm->sharedRes->tpRankToLocalRank, comm->nRanks));
-    FLAGCXCHECK(flagcxCalloc(&comm->rankToLocalRank, comm->nRanks));
-    FLAGCXCHECK(flagcxCalloc(&comm->topParentRanks, nranks));
-    for (int i = 0; i < nranks; i++) comm->topParentRanks[i] = i;
     FLAGCXCHECK(flagcxCalloc(&comm->tasks.peers, nranks));
     FLAGCXCHECK(flagcxCalloc(&comm->tasks.p2pOrder, 2 * nranks));
     // Setup mutex/cond to work inter-process
@@ -237,32 +230,6 @@ static flagcxResult_t flagcxCommInitRankFunc(struct flagcxAsyncJob *job_) {
     FLAGCXCHECKGOTO(initTransportsRank(comm, NULL), res, fail);
   } else {
     flagcxGetLocalNetFromGpu(comm->cudaDev, &comm->netDev, comm);
-  }
-
-  if (comm->peerInfo) {
-    for (int r = 0; r < comm->nRanks; r++) {
-      int localRank = 0;
-      int topParent = -1;
-      for (int i = 0; i < comm->nRanks; i++) {
-        if (comm->peerInfo[i].hostHash == comm->peerInfo[r].hostHash) {
-          if (i == r)
-            break;
-          localRank++;
-        }
-      }
-      comm->rankToLocalRank[r] = localRank;
-
-      for (int i = 0; i < comm->nRanks; i++) {
-        if (comm->peerInfo[i].hostHash == comm->peerInfo[r].hostHash &&
-            comm->peerInfo[i].pidHash == comm->peerInfo[r].pidHash) {
-          topParent = i;
-          break;
-        }
-      }
-      comm->topParentRanks[r] = topParent;
-    }
-    memcpy(comm->sharedRes->tpRankToLocalRank, comm->rankToLocalRank,
-           sizeof(int) * comm->nRanks);
   }
 
 exit:

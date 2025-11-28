@@ -59,8 +59,8 @@ struct flagcxP2pSyncSlot {
 };
 
 struct p2pRegInfo {
-  int copyDone;          // Indicates if the copy operation is complete
-  int copyStarted;       // Indicates if the copy operation has started
+  int copyDone;    // Indicates if the copy operation is complete
+  int copyStarted; // Indicates if the copy operation has started
 };
 
 struct flagcxP2pShm {
@@ -132,13 +132,12 @@ flagcxP2pRecvProxyConnect(struct flagcxProxyConnection *connection,
 flagcxResult_t flagcxP2pProxyRegister(struct flagcxProxyConnection *connection,
                                       struct flagcxProxyState *proxyState,
                                       void *reqBuff, int reqSize,
-                                      void *respBuff, int respSize,
-                                      int *done);
+                                      void *respBuff, int respSize, int *done);
 
-flagcxResult_t flagcxP2pProxyDeregister(struct flagcxProxyConnection *connection,
-                                        struct flagcxProxyState *proxyState,
-                                        void *reqBuff, int reqSize,
-                                        int *done);
+flagcxResult_t
+flagcxP2pProxyDeregister(struct flagcxProxyConnection *connection,
+                         struct flagcxProxyState *proxyState, void *reqBuff,
+                         int reqSize, int *done);
 
 flagcxResult_t
 flagcxP2pAllocateShareableBuffer(size_t size, int directMap,
@@ -154,8 +153,7 @@ flagcxResult_t flagcxP2pRegisterBuffer(struct flagcxHeteroComm *comm,
                                        struct flagcxConnector **peerConns,
                                        int *peerRanks, int nPeers,
                                        flagcxP2pRegisterMode mode,
-                                       int *regBufFlag,
-                                       uintptr_t *offsetOut, 
+                                       int *regBufFlag, uintptr_t *offsetOut,
                                        uintptr_t **peerRmtAddrsOut);
 
 flagcxResult_t flagcxP2pDeregisterBuffer(struct flagcxHeteroComm *comm,
