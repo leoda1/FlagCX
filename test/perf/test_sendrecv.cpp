@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
   timer tim;
   int recvPeer = (proc - 1 + totalProcs) % totalProcs;
   int sendPeer = (proc + 1) % totalProcs;
-  local_register = 1;
+
   if (local_register) {
     // allocate buffer
     flagcxMemAlloc(&sendbuff, max_bytes);
