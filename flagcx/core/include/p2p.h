@@ -18,6 +18,48 @@
 #define FLAGCX_P2P_IPC_HANDLE_SIZE 64
 
 #ifdef __cplusplus
+
+template <typename Int>
+inline __host__ __device__ int log2Up(Int x) {
+  int w, n;
+  if (x != 0)
+    x -= 1;
+#if __CUDA_ARCH__
+  if (sizeof(Int) <= sizeof(int)) {
+    w = 8 * sizeof(int);
+    n = __clz((int)x);
+  } else if (sizeof(Int) <= sizeof(long long)) {
+    w = 8 * sizeof(long long);
+    n = __clzll((long long)x);
+  } else {
+    static_assert(sizeof(Int) <= sizeof(long long),
+                  "Unsupported integer size.");
+  }
+#else
+  if (x == 0) {
+    return 0;
+  } else if (sizeof(Int) <= sizeof(unsigned int)) {
+    w = 8 * sizeof(unsigned int);
+    n = __builtin_clz((unsigned int)x);
+  } else if (sizeof(Int) <= sizeof(unsigned long)) {
+    w = 8 * sizeof(unsigned long);
+    n = __builtin_clzl((unsigned long)x);
+  } else if (sizeof(Int) <= sizeof(unsigned long long)) {
+    w = 8 * sizeof(unsigned long long);
+    n = __builtin_clzll((unsigned long long)x);
+  } else {
+    static_assert(sizeof(Int) <= sizeof(unsigned long long),
+                  "Unsupported integer size.");
+  }
+#endif
+  return w - n;
+}
+
+template <typename Int>
+inline __host__ __device__ Int pow2Up(Int x) {
+  return Int(1) << log2Up(x);
+}
+
 extern "C" {
 #endif
 

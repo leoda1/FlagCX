@@ -158,13 +158,83 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
     // post all send/recv tasks
     do {
       flagcxTasks *tasks = &comm->tasks;
-      for (int i = 0; i < tasks->p2pOrderSteps; i++) {
-        int peer = tasks->p2pOrder[i];
-        if (peer != comm->rank) {
-          // Handle cross-process send/recv: use proxy
-          while (!flagcxIntruQueueEmpty(&tasks->peers[peer].recvQueue)) {
+      int nRanks = comm->nRanks;
+
+      // Round 0: handle self send/recv (local copy)
+      {
+        int peer = comm->rank;
+        std::vector<flagcxTaskP2p *> sendTasks;
+        std::vector<flagcxTaskP2p *> recvTasks;
+        while (!flagcxIntruQueueEmpty(&tasks->peers[peer].sendQueue))
+          sendTasks.push_back(
+              flagcxIntruQueueDequeue(&tasks->peers[peer].sendQueue));
+        while (!flagcxIntruQueueEmpty(&tasks->peers[peer].recvQueue))
+          recvTasks.push_back(
+              flagcxIntruQueueDequeue(&tasks->peers[peer].recvQueue));
+
+        for (size_t i = 0; i < sendTasks.size();) {
+          bool matched = false;
+          for (size_t j = 0; j < recvTasks.size(); j++) {
+            if (sendTasks[i]->bytes == recvTasks[j]->bytes &&
+                sendTasks[i]->dtype == recvTasks[j]->dtype) {
+              if (sendTasks[i]->buff != recvTasks[j]->buff) {
+                flagcxProxyOp *op;
+                FLAGCXCHECK(flagcxCalloc(&op, 1));
+                op->pattern = flagcxPatternSend;
+                op->nbytes = sendTasks[i]->bytes;
+                op->sendbuff = (uint8_t *)sendTasks[i]->buff;
+                op->recvbuff = (uint8_t *)recvTasks[j]->buff;
+                op->channelId = 0;
+                op->root = peer;
+                op->connection = comm->channels[op->channelId]
+                                     .peers[peer]
+                                     ->send[0]
+                                     .proxyConn.connection;
+                op->stream = sendTasks[i]->stream;
+                op->event = semaphore->getEvent();
+                op->args.chunkSteps = 1; // single step
+                op->args.semaphore = semaphore;
+                semaphore->counter++;
+                FLAGCXCHECK(deviceAdaptor->eventRecord(op->event, op->stream));
+                if (launchStream == nullptr) {
+                  launchStream = op->stream;
+                } else {
+                  FLAGCXCHECK(
+                      deviceAdaptor->streamWaitEvent(launchStream, op->event));
+                }
+                FLAGCXCHECK(flagcxProxySaveOp(comm, op));
+              }
+              free(sendTasks[i]);
+              free(recvTasks[j]);
+              sendTasks.erase(sendTasks.begin() + i);
+              recvTasks.erase(recvTasks.begin() + j);
+              matched = true;
+              break;
+            }
+          }
+          if (!matched)
+            i++;
+        }
+        for (auto *task : sendTasks)
+          flagcxIntruQueueEnqueue(&tasks->peers[peer].sendQueue, task);
+        for (auto *task : recvTasks)
+          flagcxIntruQueueEnqueue(&tasks->peers[peer].recvQueue, task);
+      }
+
+      // Round 1..nRanks-1: use p2pSchedule to pair recv/send with different
+      // peers
+      for (int round = 1; round < nRanks; round++) {
+        int recvPeer = comm->p2pSchedule[round].recvRank;
+        int sendPeer = comm->p2pSchedule[round].sendRank;
+
+        while (!flagcxIntruQueueEmpty(&tasks->peers[recvPeer].recvQueue) ||
+               !flagcxIntruQueueEmpty(&tasks->peers[sendPeer].sendQueue)) {
+
+          // Process one recv task (for IPC register)
+          if (!flagcxIntruQueueEmpty(&tasks->peers[recvPeer].recvQueue)) {
             flagcxTaskP2p *p2p =
-                flagcxIntruQueueDequeue(&tasks->peers[peer].recvQueue);
+                flagcxIntruQueueDequeue(&tasks->peers[recvPeer].recvQueue);
+            int peer = recvPeer;
             flagcxProxyOp *op;
             FLAGCXCHECK(flagcxCalloc(&op, 1));
             op->pattern = flagcxPatternRecv;
@@ -258,9 +328,12 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
             FLAGCXCHECK(flagcxProxySaveOp(comm, op));
             free(p2p);
           }
-          while (!flagcxIntruQueueEmpty(&tasks->peers[peer].sendQueue)) {
+
+          // Process one send task (for IPC lookup - after recv's register)
+          if (!flagcxIntruQueueEmpty(&tasks->peers[sendPeer].sendQueue)) {
             flagcxTaskP2p *p2p =
-                flagcxIntruQueueDequeue(&tasks->peers[peer].sendQueue);
+                flagcxIntruQueueDequeue(&tasks->peers[sendPeer].sendQueue);
+            int peer = sendPeer;
             flagcxProxyOp *op;
             FLAGCXCHECK(flagcxCalloc(&op, 1));
             op->pattern = flagcxPatternSend;
@@ -350,78 +423,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
             FLAGCXCHECK(flagcxProxySaveOp(comm, op));
             free(p2p);
           }
-        } else {
-          std::vector<flagcxTaskP2p *> sendTasks;
-          std::vector<flagcxTaskP2p *> recvTasks;
-          while (!flagcxIntruQueueEmpty(&tasks->peers[peer].sendQueue))
-            sendTasks.push_back(
-                flagcxIntruQueueDequeue(&tasks->peers[peer].sendQueue));
-          while (!flagcxIntruQueueEmpty(&tasks->peers[peer].recvQueue))
-            recvTasks.push_back(
-                flagcxIntruQueueDequeue(&tasks->peers[peer].recvQueue));
-
-          for (size_t i = 0; i < sendTasks.size();) {
-            bool matched = false;
-            for (size_t j = 0; j < recvTasks.size(); j++) {
-              if (sendTasks[i]->bytes == recvTasks[j]->bytes &&
-                  sendTasks[i]->dtype == recvTasks[j]->dtype) {
-                if (sendTasks[i]->buff != recvTasks[j]->buff) {
-                  flagcxProxyOp *op;
-                  FLAGCXCHECK(flagcxCalloc(&op, 1));
-                  op->pattern = flagcxPatternSend;
-                  op->nbytes = sendTasks[i]->bytes;
-                  op->sendbuff = (uint8_t *)sendTasks[i]->buff;
-                  op->recvbuff = (uint8_t *)recvTasks[j]->buff;
-                  op->channelId = 0;
-                  op->root = peer;
-                  op->connection = comm->channels[op->channelId]
-                                       .peers[peer]
-                                       ->send[0]
-                                       .proxyConn.connection;
-                  op->stream = sendTasks[i]->stream;
-                  op->event = semaphore->getEvent();
-                  op->args.chunkSteps = 1; // single step
-                  op->args.semaphore = semaphore;
-                  semaphore->counter++;
-                  FLAGCXCHECK(
-                      deviceAdaptor->eventRecord(op->event, op->stream));
-                  if (launchStream == nullptr) {
-                    launchStream = op->stream;
-                  } else {
-                    FLAGCXCHECK(deviceAdaptor->streamWaitEvent(launchStream,
-                                                               op->event));
-                  }
-                  FLAGCXCHECK(flagcxProxySaveOp(comm, op));
-                }
-                free(sendTasks[i]);
-                free(recvTasks[j]);
-                sendTasks.erase(sendTasks.begin() + i);
-                recvTasks.erase(recvTasks.begin() + j);
-                matched = true;
-                break;
-              }
-            }
-            if (!matched)
-              i++;
-          }
-          for (auto *task : sendTasks)
-            flagcxIntruQueueEnqueue(&tasks->peers[peer].sendQueue, task);
-          for (auto *task : recvTasks)
-            flagcxIntruQueueEnqueue(&tasks->peers[peer].recvQueue, task);
         }
       }
-      // Clean up p2pOrder: remove peers with empty queues, keep peers with
-      // pending operations
-      int newOrderSteps = 0;
-      for (int i = 0; i < tasks->p2pOrderSteps; i++) {
-        int peer = tasks->p2pOrder[i];
-        // Keep peer in order if it still has pending send or recv operations
-        if (!flagcxIntruQueueEmpty(&tasks->peers[peer].sendQueue) ||
-            !flagcxIntruQueueEmpty(&tasks->peers[peer].recvQueue)) {
-          tasks->p2pOrder[newOrderSteps++] = peer;
-        }
-      }
-      tasks->p2pOrderSteps = newOrderSteps;
+      tasks->p2pOrderSteps = 0;
       comm = comm->groupNext;
     } while (comm != nullptr);
   }

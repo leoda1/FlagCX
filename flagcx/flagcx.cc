@@ -178,7 +178,7 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
     WARN("Invalid buffer or size for buffer registration.");
     return flagcxInvalidArgument;
   }
-  if (useHomoComm(comm)) {
+  if (useHomoComm(comm) && !useHeteroComm()) {
     cclAdaptors[flagcxCCLAdaptorDevice]->commRegister(comm->homo_comm, buff,
                                                       size, handle);
   } else {
@@ -191,7 +191,7 @@ flagcxResult_t flagcxCommRegister(const flagcxComm_t comm, void *buff,
 
 flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle) {
   FLAGCXCHECK(flagcxEnsureCommReady(comm));
-  if (useHomoComm(comm)) {
+  if (useHomoComm(comm) && !useHeteroComm()) {
     cclAdaptors[flagcxCCLAdaptorDevice]->commDeregister(comm->homo_comm,
                                                         handle);
   } else {
