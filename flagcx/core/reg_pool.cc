@@ -104,6 +104,17 @@ flagcxResult_t flagcxRegPool::removeRegItemP2pHandles(void *comm,
   return flagcxSuccess;
 }
 
+void flagcxRegPool::mapRegItemPages(uintptr_t commKey, flagcxRegItem *reg) {
+  if (reg == nullptr) {
+    return;
+  }
+  auto &regCommMap = regMap[commKey];
+  for (uintptr_t addr = reg->beginAddr; addr < reg->endAddr;
+       addr += pageSize) {
+    regCommMap[addr] = reg;
+  }
+}
+
 flagcxResult_t flagcxRegPool::registerBuffer(void *comm, void *data,
                                              size_t length) {
   if (comm == nullptr || data == nullptr || length == 0)
@@ -119,7 +130,7 @@ flagcxResult_t flagcxRegPool::registerBuffer(void *comm, void *data,
     if (beginAddr < it->beginAddr) {
       flagcxRegItem reg{beginAddr, endAddr, 1, {}};
       auto &insertedReg = *regCommPool.insert(it, std::move(reg));
-      regMap[commKey][reinterpret_cast<uintptr_t>(data)] = &insertedReg;
+      mapRegItemPages(commKey, &insertedReg);
       return flagcxSuccess;
       // already inserted, just increase ref count
     } else if (it->beginAddr <= beginAddr && it->endAddr >= endAddr) {
@@ -131,7 +142,7 @@ flagcxResult_t flagcxRegPool::registerBuffer(void *comm, void *data,
   // not found, insert to the end
   flagcxRegItem reg{beginAddr, endAddr, 1, {}};
   regCommPool.push_back(std::move(reg));
-  regMap[commKey][reinterpret_cast<uintptr_t>(data)] = &regCommPool.back();
+  mapRegItemPages(commKey, &regCommPool.back());
   return flagcxSuccess;
 }
 

@@ -29,8 +29,9 @@ public:
   void dump();
 
 private:
+  void mapRegItemPages(uintptr_t commKey, flagcxRegItem *reg);
   std::map<uintptr_t, std::map<uintptr_t, flagcxRegItem *>>
-      regMap; // <commPtr, <dataPtr, regItemPtr>>
+      regMap; // <commPtr, <pageBasePtr, regItemPtr>>
   std::map<uintptr_t, std::list<flagcxRegItem>>
       regPool; // <commPtr, regItemList>
   uintptr_t pageSize;
