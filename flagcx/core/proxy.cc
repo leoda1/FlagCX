@@ -853,7 +853,6 @@ static flagcxResult_t proxyServiceInitOp(int type, struct flagcxSocket *sock,
   FLAGCXCHECK(flagcxSocketRecv(sock, &asyncOp->opId, sizeof(asyncOp->opId)));
 
   asyncOp->connection->sock = sock;
-  // asyncOp->proxyState = comm->proxyState;
   if (asyncOp->respSize)
     FLAGCXCHECK(flagcxCalloc(&asyncOp->respBuff, asyncOp->respSize));
 
