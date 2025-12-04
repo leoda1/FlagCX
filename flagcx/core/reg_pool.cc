@@ -109,8 +109,7 @@ void flagcxRegPool::mapRegItemPages(uintptr_t commKey, flagcxRegItem *reg) {
     return;
   }
   auto &regCommMap = regMap[commKey];
-  for (uintptr_t addr = reg->beginAddr; addr < reg->endAddr;
-       addr += pageSize) {
+  for (uintptr_t addr = reg->beginAddr; addr < reg->endAddr; addr += pageSize) {
     regCommMap[addr] = reg;
   }
 }
