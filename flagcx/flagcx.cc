@@ -143,7 +143,7 @@ flagcxResult_t flagcxMemAlloc(void **ptr, size_t size, flagcxComm_t comm) {
     WARN("Invalid pointer(!=NULL) or size(0) for allocation.");
     return flagcxSuccess;
   }
-  if (comm != NULL && useHomoComm(comm)) {
+  if (comm != NULL && useHomoComm(comm) && !useHeteroComm()) {
     FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memAlloc(ptr, size));
     return flagcxSuccess;
   }
@@ -162,7 +162,7 @@ flagcxResult_t flagcxMemFree(void *ptr, flagcxComm_t comm) {
     WARN("Invalid pointer(=NULL)for de-allocation.");
     return flagcxSuccess;
   }
-  if (comm != NULL && useHomoComm(comm)) {
+  if (comm != NULL && useHomoComm(comm) && !useHeteroComm()) {
     FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->memFree(ptr));
     return flagcxSuccess;
   }
