@@ -11,10 +11,10 @@
 #include "flagcx.h"
 #include "group.h"
 #include "net.h"
-#include "utils.h"
 #include "topo.h"
 #include "transport.h"
 #include "type.h"
+#include "utils.h"
 #include <algorithm>
 #include <string.h>
 
