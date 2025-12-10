@@ -12,6 +12,25 @@ int64_t flagcxP2pBufferSize;
 int64_t flagcxP2pChunkSize;
 int64_t flagcxP2pChunks;
 
+size_t computeP2pChunkSize(size_t nbytes) {
+  size_t dynamic_buffer = flagcxP2pBufferSize;
+  if (nbytes >= (size_t)flagcxP2pBufferSize) {
+    dynamic_buffer = flagcxP2pBufferSize;
+  } else {
+    size_t msize = nbytes / (1024 * 1024);
+    int adjustFactor;
+    if (msize >= 32) adjustFactor = 1;
+    else if (msize >= 16) adjustFactor = 2;
+    else if (msize >= 8) adjustFactor = 4;
+    else if (msize >= 4) adjustFactor = 8;
+    else if (msize >= 2) adjustFactor = 16;
+    else if (msize >= 1) adjustFactor = 32;
+    else adjustFactor = 64;
+    dynamic_buffer = flagcxP2pBufferSize / adjustFactor;
+  }
+  return dynamic_buffer / flagcxP2pChunks;
+}
+
 struct p2pIpcExpInfo {
   flagcxP2pIpcDesc ipcDesc;
   bool legacyIpcCap;
@@ -145,7 +164,7 @@ flagcxResult_t flagcxP2pProxySend(struct flagcxP2pResources *resources,
         args->subs[step].stepSize =
             std::min(args->chunkSize, size - args->totalCopySize);
         args->subs[step].stepBuff =
-            resources->proxyInfo.recvFifo + (flagcxP2pChunkSize * step);
+            resources->proxyInfo.recvFifo + (args->chunkSize * step);
 
         FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
             args->subs[step].stepBuff, (char *)data + args->totalCopySize,
@@ -266,7 +285,7 @@ flagcxResult_t flagcxP2pProxyRecv(struct flagcxP2pResources *resources,
         args->subs[step].stepSize =
             std::min(args->chunkSize, size - args->totalCopySize);
         args->subs[step].stepBuff =
-            resources->proxyInfo.recvFifo + (flagcxP2pChunkSize * step);
+            resources->proxyInfo.recvFifo + (args->chunkSize * step);
 
         FLAGCXCHECK(deviceAdaptor->deviceMemcpy(
             (char *)data + args->totalCopySize, args->subs[step].stepBuff,

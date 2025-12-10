@@ -256,7 +256,7 @@ fail:
 FLAGCX_PARAM(P2pBufferSize, "P2P_BUFFER_SIZE",
              64L * 1024 * 1024); // default value to 64MB
 FLAGCX_PARAM(P2pChunkSize, "P2P_CHUNK_SIZE",
-             4L * 1024 * 1024); // default value to 4MB
+             16L * 1024 * 1024); // default value to 16MB
 FLAGCX_PARAM(NetBufferSize, "NET_BUFFER_SIZE",
              64L * 1024 * 1024); // default value to 64MB
 FLAGCX_PARAM(NetChunkSize, "NET_CHUNK_SIZE",
