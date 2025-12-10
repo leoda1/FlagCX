@@ -246,12 +246,13 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                  .peers[peer]
                                  ->recv[0]
                                  .proxyConn.connection;
-            op->args.chunkSize = flagcxNetChunkSize;
-            op->args.chunkSteps = (p2p->bytes + flagcxNetChunkSize - 1) / (flagcxNetChunkSize);
-            op->args.sendStepMask = FLAGCX_NET_MAX_STEPS - 1;
             op->args.deviceFuncRelaxedOrdering = deviceFuncRelaxedOrdering;
             op->stream = p2p->stream;
             if (op->connection->transport == TRANSPORT_P2P) {
+              size_t dynamicChunkSize = computeP2pChunkSize(p2p->bytes);
+              op->args.chunkSize = dynamicChunkSize;
+              op->args.chunkSteps = (p2p->bytes + dynamicChunkSize - 1) / dynamicChunkSize;
+              op->args.sendStepMask = FLAGCX_P2P_MAX_STEPS - 1;
               setP2pSlotInfo(comm->rank, peer, p2p->bytes, p2p->dtype, 1,
                              &op->args.p2pOpHash, &op->args.p2pSlotIdx);
               setP2pSlotInfo(peer, comm->rank, p2p->bytes, p2p->dtype, 0,
@@ -286,6 +287,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
             }
             // launch proxyRegister op if not yet registered
             if (op->connection->transport == TRANSPORT_NET) {
+              op->args.chunkSize = flagcxNetChunkSize;
+              op->args.chunkSteps = (p2p->bytes + flagcxNetChunkSize - 1) / (flagcxNetChunkSize);
+              op->args.sendStepMask = FLAGCX_NET_MAX_STEPS - 1;
               flagcxConnector *peerConns[] = {
                   comm->channels[op->channelId].peers[peer]->recv};
               FLAGCXCHECK(flagcxNetRegisterBuffer(
@@ -345,12 +349,13 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                  .peers[peer]
                                  ->send[0]
                                  .proxyConn.connection;
-            op->args.chunkSize = flagcxNetChunkSize;
-            op->args.chunkSteps = (p2p->bytes + flagcxNetChunkSize - 1) / (flagcxNetChunkSize);
-            op->args.sendStepMask = FLAGCX_NET_MAX_STEPS - 1;
             op->args.deviceFuncRelaxedOrdering = deviceFuncRelaxedOrdering;
             op->stream = p2p->stream;
             if (op->connection->transport == TRANSPORT_P2P) {
+              size_t dynamicChunkSize = computeP2pChunkSize(p2p->bytes);
+              op->args.chunkSize = dynamicChunkSize;
+              op->args.chunkSteps = (p2p->bytes + dynamicChunkSize - 1) / dynamicChunkSize;
+              op->args.sendStepMask = FLAGCX_P2P_MAX_STEPS - 1;
               setP2pSlotInfo(comm->rank, peer, p2p->bytes, p2p->dtype, 0,
                              &op->args.p2pOpHash, &op->args.p2pSlotIdx);
               setP2pSlotInfo(peer, comm->rank, p2p->bytes, p2p->dtype, 1,
@@ -381,6 +386,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
             }
             // launch proxyRegister op if not yet registered
             if (op->connection->transport == TRANSPORT_NET) {
+              op->args.chunkSize = flagcxNetChunkSize;
+              op->args.chunkSteps = (p2p->bytes + flagcxNetChunkSize - 1) / (flagcxNetChunkSize);
+              op->args.sendStepMask = FLAGCX_NET_MAX_STEPS - 1;
               flagcxConnector *peerConns[] = {
                   comm->channels[op->channelId].peers[peer]->send};
               FLAGCXCHECK(flagcxNetRegisterBuffer(

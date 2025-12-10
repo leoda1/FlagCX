@@ -12,9 +12,10 @@
 extern int64_t flagcxP2PBufferSize;
 extern int64_t flagcxP2PChunkSize;
 
-#define FLAGCX_P2P_MAX_STEPS  16
+#define FLAGCX_P2P_MAX_STEPS 4 // 1,2,4,8
+size_t computeP2pChunkSize(size_t nbytes);
 #define FLAGCX_P2P_MAX_OPS                                                  \
-  (FLAGCX_P2P_MAX_STEPS * 2) // Maximum number of concurrent P2P operation pairs
+  32 // Maximum number of concurrent P2P operation pairs
 #define FLAGCX_P2P_IPC_HANDLE_SIZE 64
 
 #ifdef __cplusplus
