@@ -13,12 +13,10 @@ int64_t flagcxP2pChunkSize;
 int64_t flagcxP2pChunks;
 
 size_t computeP2pChunkSize(size_t nbytes) {
-  size_t dynamicBuffer = flagcxP2pBufferSize;
-  if (nbytes >= (size_t)flagcxP2pBufferSize) {
-    dynamicBuffer = flagcxP2pBufferSize;
-  } else {
+  size_t dynamicBufferSize = flagcxP2pBufferSize;
+  if (nbytes < (size_t)flagcxP2pBufferSize) {
     size_t msize = nbytes / (1024 * 1024);
-    int adjustFactor;
+    int adjustFactor=0;
     if (msize >= 32)
       adjustFactor = 1;
     else if (msize >= 16)
@@ -33,9 +31,9 @@ size_t computeP2pChunkSize(size_t nbytes) {
       adjustFactor = 32;
     else
       adjustFactor = 64;
-    dynamicBuffer = flagcxP2pBufferSize / adjustFactor;
+    dynamicBufferSize = flagcxP2pBufferSize / adjustFactor;
   }
-  return dynamicBuffer / flagcxP2pChunks;
+  return dynamicBufferSize / flagcxP2pChunks;
 }
 
 struct p2pIpcExpInfo {
