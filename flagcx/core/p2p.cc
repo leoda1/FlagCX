@@ -16,7 +16,7 @@ size_t computeP2pChunkSize(size_t nbytes) {
   size_t dynamicBufferSize = flagcxP2pBufferSize;
   if (nbytes < (size_t)flagcxP2pBufferSize) {
     size_t msize = nbytes / (1024 * 1024);
-    int adjustFactor=0;
+    int adjustFactor = 0;
     if (msize >= 32)
       adjustFactor = 1;
     else if (msize >= 16)
