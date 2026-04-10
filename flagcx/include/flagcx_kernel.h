@@ -4,6 +4,8 @@
 #include "adaptor.h"
 #include "flagcx.h"
 
+struct flagcxHeteroComm;
+
 #define FLAGCX_FIFO_CAPACITY 128
 #define flagcxTriggerMask(w) ((w == 64) ? ~0ull : ((1ull << w) - 1))
 
@@ -436,7 +438,7 @@ flagcxResult_t flagcxCommDrainDeferredFrees(flagcxComm_t comm);
 flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
                                      size_t size);
 // Release data buffer resources (MR, network connections, handle arrays).
-flagcxResult_t flagcxOneSideDeregister(const flagcxComm_t comm);
+flagcxResult_t flagcxOneSideDeregister(struct flagcxHeteroComm *heteroComm);
 
 // One-sided signal buffer registration.
 // Registers a per-rank signal buffer used by one-sided operations.
@@ -456,7 +458,7 @@ flagcxResult_t flagcxOneSideDeregister(const flagcxComm_t comm);
 flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
                                            size_t size, int ptrType);
 // Release signal buffer resources (MR, network connections, handle arrays).
-flagcxResult_t flagcxOneSideSignalDeregister(const flagcxComm_t comm);
+flagcxResult_t flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm);
 
 // One-sided staging buffer registration (host-pinned memory for PutValue).
 // Must be called after flagcxOneSideSignalRegister (requires full-mesh

@@ -164,6 +164,8 @@ struct flagcxRmaProxyState; // forward declaration; defined in flagcx_hetero.h
 
 #define FLAGCX_MAGIC 0x0280028002800280 // Nickel atomic number is 28.
 
+struct flagcxOneSideHandleInfo;
+
 struct flagcxHeteroComm {
   uint64_t startMagic;
   struct flagcxMemoryStack memPermanent, memScoped;
@@ -374,6 +376,15 @@ struct flagcxHeteroComm {
   void *netAdaptorPtr;
   // Async RMA proxy state (one-sided Put/Get offload thread).
   struct flagcxRmaProxyState *rmaProxy;
+
+  // One-sided signal / staging handle
+  struct flagcxOneSideHandleInfo *signalHandle;
+  struct flagcxOneSideHandleInfo *stagingHandle;
+
+  // Per-comm dynamic array of one-sided data handles
+  struct flagcxOneSideHandleInfo **oneSideHandles;
+  int oneSideHandleCount;
+  int oneSideHandleCapacity;
 };
 
 typedef struct flagcxHeteroComm *flagcxHeteroComm_t;

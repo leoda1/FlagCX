@@ -1268,16 +1268,16 @@ void *flagcxProxyKernelService(void *args) {
 
   auto validateOneSidedPeer = [](struct flagcxHeteroComm *comm,
                                  int peerRank) -> flagcxResult_t {
-    if (globalOneSideHandleCount == 0 || globalOneSideHandleTable[0] == NULL)
+    struct flagcxOneSideHandleInfo *meshH =
+        (comm->oneSideHandleCount > 0) ? comm->oneSideHandles[0] : NULL;
+    if (meshH == NULL)
       return flagcxNotSupported;
     if (peerRank < 0 || peerRank >= comm->nRanks)
       return flagcxInvalidArgument;
 
     // Check full-mesh connection exists for this peer (including self-loopback)
-    struct flagcxOneSideHandleInfo *handles =
-        (struct flagcxOneSideHandleInfo *)globalOneSideHandleTable[0];
-    if (handles->fullSendComms == NULL ||
-        handles->fullSendComms[peerRank] == NULL)
+    if (meshH->fullSendComms == NULL ||
+        meshH->fullSendComms[peerRank] == NULL)
       return flagcxNotSupported;
 
     return flagcxSuccess;
@@ -1403,9 +1403,9 @@ void *flagcxProxyKernelService(void *args) {
           res = validateOneSidedPeer(comm, peerRank);
           if (res != flagcxSuccess)
             break;
-          if (globalOneSideSignalHandles == NULL) {
-            WARN("flagcxDevicePrimSignal: globalOneSideSignalHandles not "
-                 "initialized — call flagcxOneSideSignalRegister() before use");
+          if (comm->signalHandle == NULL) {
+            WARN("flagcxDevicePrimSignal: signal handles not initialized "
+                 "for this comm — call flagcxOneSideSignalRegister() before use");
             res = flagcxInternalError;
             break;
           }
@@ -1469,9 +1469,9 @@ void *flagcxProxyKernelService(void *args) {
         int signalIdx = (int)ptr->getSignalIdx();
         uint64_t signalValue = ptr->getSignalValue();
         size_t signalOff = (size_t)signalIdx * sizeof(uint64_t);
-        if (globalOneSideSignalHandles == NULL) {
-          WARN("flagcxDevicePrimPutSignal: globalOneSideSignalHandles not "
-               "initialized — call flagcxOneSideSignalRegister() before use");
+        if (comm->signalHandle == NULL) {
+          WARN("flagcxDevicePrimPutSignal: signal handles not initialized "
+               "for this comm — call flagcxOneSideSignalRegister() before use");
           res = flagcxInternalError;
           break;
         }

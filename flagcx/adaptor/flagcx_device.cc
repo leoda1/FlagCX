@@ -911,7 +911,7 @@ flagcxResult_t flagcxDevCommDestroy(flagcxComm_t comm,
   if (comm != nullptr && comm->heteroComm != nullptr &&
       comm->heteroComm->devCommHandle == devComm) {
     if (devComm->signalBuffer) {
-      flagcxOneSideSignalDeregister(comm);
+      flagcxOneSideSignalDeregister(comm->heteroComm);
     }
     comm->heteroComm->devCommHandle = nullptr;
   }
@@ -963,19 +963,20 @@ flagcxResult_t flagcxDevMemCreate(flagcxComm_t comm, void *buff, size_t size,
   handle->rawPtr = buff;
   handle->ipcIndex = -1;
 
-  // ---- Per-window MR layer: lookup buff in globalOneSideHandleTable ----
+  // ---- Per-comm MR layer: lookup buff in heteroComm->oneSideHandles ----
   handle->mrIndex = -1;
   handle->mrBase = 0;
-  if (comm != nullptr) {
-    for (int i = 0; i < globalOneSideHandleCount; i++) {
-      struct flagcxOneSideHandleInfo *info = globalOneSideHandleTable[i];
+  if (comm != nullptr && comm->heteroComm != nullptr) {
+    struct flagcxHeteroComm *hc = comm->heteroComm;
+    for (int i = 0; i < hc->oneSideHandleCount; i++) {
+      struct flagcxOneSideHandleInfo *info = hc->oneSideHandles[i];
       if (info != NULL && info->baseVas != NULL) {
         uintptr_t base = info->baseVas[comm->rank];
         if ((uintptr_t)buff == base) {
           handle->mrIndex = i;
           handle->mrBase = base;
           INFO(FLAGCX_INIT,
-               "flagcxDevMemCreate: buff %p matched handleTable[%d], "
+               "flagcxDevMemCreate: buff %p matched oneSideHandles[%d], "
                "mrBase=0x%lx",
                buff, i, (unsigned long)base);
           break;

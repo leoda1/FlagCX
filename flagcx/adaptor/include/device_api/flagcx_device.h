@@ -129,8 +129,8 @@ struct flagcxDevMemInternal {
   bool isSymmetric; // true only for FLAGCX_WIN_COLL_SYMMETRIC (enables
                     // one-sided)
 
-  // ---- Per-window MR layer (set by flagcxDevMemCreate from handle table) ----
-  int mrIndex; // index into globalOneSideHandleTable (-1 if not registered)
+  // ---- Per-comm MR layer (set by flagcxDevMemCreate from handle table) ----
+  int mrIndex; // index into heteroComm->oneSideHandles (-1 if not registered)
   uintptr_t mrBase; // handles[mrIndex]->baseVas[myRank] (cached for device)
 
   // ---- IPC layer (set if IPC exchange succeeds, else nullptr) ----

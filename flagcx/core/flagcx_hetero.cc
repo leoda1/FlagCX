@@ -111,9 +111,9 @@ static void *flagcxRmaProgressThread(void *arg) {
 
       // Resolve sendComm from desc->peer.
       void *sendComm = NULL;
-      if (globalOneSideHandleCount > 0 && globalOneSideHandleTable[0] != NULL &&
-          globalOneSideHandleTable[0]->fullSendComms != NULL) {
-        sendComm = globalOneSideHandleTable[0]->fullSendComms[p];
+      if (comm->oneSideHandleCount > 0 && comm->oneSideHandles[0] != NULL &&
+          comm->oneSideHandles[0]->fullSendComms != NULL) {
+        sendComm = comm->oneSideHandles[0]->fullSendComms[p];
       }
       if (sendComm == NULL) {
         WARN("flagcxRmaProgressThread: no sendComm for peer %d", p);
@@ -126,8 +126,8 @@ static void *flagcxRmaProgressThread(void *arg) {
       // Resolve data MR handles (NULL when size==0 or not applicable).
       void **srcHandles = NULL, **dstHandles = NULL;
       if (desc->size > 0 && desc->srcMrIdx >= 0) {
-        srcHandles = (void **)globalOneSideHandleTable[desc->srcMrIdx];
-        dstHandles = (void **)globalOneSideHandleTable[desc->dstMrIdx];
+        srcHandles = (void **)comm->oneSideHandles[desc->srcMrIdx];
+        dstHandles = (void **)comm->oneSideHandles[desc->dstMrIdx];
       }
 
       flagcxResult_t res = flagcxSuccess;
@@ -139,7 +139,7 @@ static void *flagcxRmaProgressThread(void *arg) {
           break;
 
         case FLAGCX_RMA_PUT_SIGNAL: {
-          void **sigHandles = (void **)globalOneSideSignalHandles;
+          void **sigHandles = (void **)comm->signalHandle;
           res = comm->netAdaptor->iputSignal(
               sendComm, desc->srcOff, desc->dstOff, desc->size, comm->rank, p,
               srcHandles, dstHandles, desc->signalOff, sigHandles,
@@ -155,7 +155,7 @@ static void *flagcxRmaProgressThread(void *arg) {
 
         case FLAGCX_RMA_PUT_VALUE: {
           struct flagcxOneSideHandleInfo *stagingH =
-              globalOneSideStagingHandles;
+              comm->stagingHandle;
           if (stagingH == NULL || stagingH->baseVas == NULL) {
             WARN("flagcxRmaProgressThread: staging handles not initialized");
             res = flagcxInternalError;
@@ -164,7 +164,7 @@ static void *flagcxRmaProgressThread(void *arg) {
           *(volatile uint64_t *)(stagingH->baseVas[comm->rank]) =
               desc->putValue;
           void **stagingHandles = (void **)stagingH;
-          void **dstH = (void **)globalOneSideHandleTable[desc->dstMrIdx];
+          void **dstH = (void **)comm->oneSideHandles[desc->dstMrIdx];
           res = comm->netAdaptor->iput(sendComm, 0, desc->dstOff,
                                        sizeof(uint64_t), comm->rank, p,
                                        stagingHandles, dstH, &desc->request);
@@ -508,8 +508,7 @@ flagcxResult_t flagcxHeteroWaitSignal(flagcxHeteroComm_t comm, int peer,
                                       size_t signalOffset, uint64_t expected,
                                       flagcxStream_t stream) {
   (void)peer;
-  struct flagcxOneSideHandleInfo *info =
-      (struct flagcxOneSideHandleInfo *)globalOneSideSignalHandles;
+  struct flagcxOneSideHandleInfo *info = comm->signalHandle;
   if (info == NULL || info->baseVas == NULL)
     return flagcxNotSupported;
 
@@ -536,9 +535,9 @@ flagcxResult_t flagcxHeteroPutValue(flagcxHeteroComm_t comm, int peer,
          comm->nRanks);
     return flagcxInvalidArgument;
   }
-  if (dstMrIdx < 0 || dstMrIdx >= globalOneSideHandleCount) {
+  if (dstMrIdx < 0 || dstMrIdx >= comm->oneSideHandleCount) {
     WARN("flagcxHeteroPutValue: dstMrIdx %d out of range (count=%d)", dstMrIdx,
-         globalOneSideHandleCount);
+         comm->oneSideHandleCount);
     return flagcxInvalidArgument;
   }
   if (comm->rmaProxy == NULL) {

@@ -449,6 +449,28 @@ flagcxResult_t flagcxRecv(void *recvbuff, size_t count,
  * communicators backed by an RDMA-capable net adaptor.
  */
 
+/* Register a data buffer for one-sided RDMA operations.  Collective: ALL ranks
+ * in the communicator must call with their local buffer.  Internally performs
+ * an AllGather of MR metadata so every rank knows every other rank's rkey and
+ * base VA. */
+flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
+                                     size_t size);
+
+/* Register a signal buffer for one-sided RDMA operations.
+ * ptrType: FLAGCX_PTR_CUDA for device memory, FLAGCX_PTR_HOST for host-pinned
+ * memory.  Collective: ALL ranks in the communicator must call. */
+flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
+                                           size_t size, int ptrType);
+
+/* Register a host-pinned staging buffer for one-sided PutValue operations.
+ * Must be called after flagcxOneSideSignalRegister.  Collective: ALL ranks
+ * in the communicator must call. */
+flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
+                                            size_t size);
+
+/* Release staging buffer MR resources. */
+flagcxResult_t flagcxOneSideStagingDeregister(const flagcxComm_t comm);
+
 /* RDMA READ: pull size bytes from remote peer's buffer at srcOffset into the
  * local buffer at dstOffset. srcMrIdx / dstMrIdx index the per-window MR
  * handle table populated by flagcxOneSideRegister. */
