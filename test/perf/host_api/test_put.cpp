@@ -289,8 +289,8 @@ int main(int argc, char *argv[]) {
   res = flagcxCommDeregister(comm, dataHandle);
   fatal(res, "flagcxCommDeregister failed", proc);
 
-  flagcxOneSideDeregister(comm->heteroComm);
   flagcxOneSideSignalDeregister(comm->heteroComm);
+  flagcxOneSideDeregister(comm->heteroComm);
   flagcxMemFree(dataWindow);
   flagcxMemFree(signalWindow);
   free(hostStaging);
