@@ -158,12 +158,6 @@ int main(int argc, char *argv[]) {
   devHandle->deviceMemset(dataWin2, 0, dataBytes, flagcxMemDevice, NULL);
   devHandle->deviceMemset(sigWin2,  0, signalTotalBytes, flagcxMemDevice, NULL);
 
-  void *handle1 = nullptr, *handle2 = nullptr;
-  fatal(flagcxCommRegister(comm1, dataWin1, dataBytes, &handle1),
-        "CommRegister (comm1)", proc);
-  fatal(flagcxCommRegister(comm2, dataWin2, dataBytes, &handle2),
-        "CommRegister (comm2)", proc);
-
   flagcxResult_t r1 = flagcxOneSideRegister(comm1, dataWin1, dataBytes);
   if (r1 == flagcxNotSupported) {
     if (proc == 0)
@@ -312,8 +306,6 @@ cleanup_no_onesided:
   MPI_Barrier(MPI_COMM_WORLD);
   sleep(1);
 
-  flagcxCommDeregister(comm1, handle1);
-  flagcxCommDeregister(comm2, handle2);
   flagcxMemFree(dataWin1);
   flagcxMemFree(dataWin2);
   flagcxMemFree(sigWin1);
