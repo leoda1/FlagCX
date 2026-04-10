@@ -304,6 +304,14 @@ class FLAGCXLibrary:
             ctypes.c_size_t, ctypes.c_uint64,
             flagcxStream_t
         ]),
+
+        Function("flagcxReadCounter", flagcxResult_t, [
+            flagcxComm_t, ctypes.POINTER(ctypes.c_uint64)
+        ]),
+
+        Function("flagcxWaitCounter", flagcxResult_t, [
+            flagcxComm_t, ctypes.c_uint64
+        ]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -518,6 +526,16 @@ class FLAGCXLibrary:
         self.FLAGCX_CHECK(self._funcs["flagcxWaitSignal"](
             comm, peer, ctypes.c_size_t(signalOffset),
             ctypes.c_uint64(expected), stream))
+
+    def flagcxReadCounter(self, comm: flagcxComm_t) -> int:
+        count = ctypes.c_uint64(0)
+        self.FLAGCX_CHECK(self._funcs["flagcxReadCounter"](
+            comm, ctypes.byref(count)))
+        return count.value
+
+    def flagcxWaitCounter(self, comm: flagcxComm_t, target: int) -> None:
+        self.FLAGCX_CHECK(self._funcs["flagcxWaitCounter"](
+            comm, ctypes.c_uint64(target)))
 
     def adaptor_stream_create(self):
         new_stream = flagcxStream_t()

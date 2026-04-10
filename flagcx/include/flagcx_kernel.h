@@ -433,40 +433,13 @@ flagcxResult_t flagcxCommRelayDestroy(flagcxComm_t comm);
 void flagcxCommDeferFree(flagcxComm_t comm, void *ptr, int memType);
 flagcxResult_t flagcxCommDrainDeferredFrees(flagcxComm_t comm);
 
-// One-sided data buffer registration.
-// Must be called after flagcxCommInitRank and before one-sided operations.
-flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
-                                     size_t size);
 // Release data buffer resources (MR, network connections, handle arrays).
 flagcxResult_t flagcxOneSideDeregister(struct flagcxHeteroComm *heteroComm);
 
-// One-sided signal buffer registration.
-// Registers a per-rank signal buffer used by one-sided operations.
-//   - buff: pointer to the signal buffer. The pointer type is selected by
-//     ptrType and may be either device memory or host-pinned memory.
-//   - size: size in bytes of the signal buffer.
-//   - ptrType: indicates the type of pointer passed in buff and controls the
-//     MR registration flags / ordering semantics:
-//       * FLAGCX_PTR_CUDA : buff is a CUDA device pointer. The MR is
-//         registered with FORCE_SO to guarantee that remote visibility of
-//         signal updates is ordered after prior GPU writes to the buffer.
-//       * FLAGCX_PTR_HOST : buff is host-pinned memory (e.g., cudaHostAlloc
-//         or other pinned allocation). The MR is registered without FORCE_SO;
-//         the caller is responsible for using appropriate host/device
-//         synchronization to ensure ordering and visibility of signal writes.
-// Must be called after flagcxCommInitRank and before one-sided operations.
-flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
-                                           size_t size, int ptrType);
 // Release signal buffer resources (MR, network connections, handle arrays).
+// flagcxOneSideSignalRegister / flagcxOneSideStagingRegister /
+// flagcxOneSideStagingDeregister are declared in flagcx.h (extern "C").
 flagcxResult_t flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm);
-
-// One-sided staging buffer registration (host-pinned memory for PutValue).
-// Must be called after flagcxOneSideSignalRegister (requires full-mesh
-// connections).
-flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
-                                            size_t size);
-// Release staging buffer MR resources.
-flagcxResult_t flagcxOneSideStagingDeregister(const flagcxComm_t comm);
 
 // One-sided barrier MR registration (host-pinned memory for inter-node
 // barrier). Collective: ALL ranks must call. Leaders pass recvComm+buff,
