@@ -1276,8 +1276,7 @@ void *flagcxProxyKernelService(void *args) {
       return flagcxInvalidArgument;
 
     // Check full-mesh connection exists for this peer (including self-loopback)
-    if (meshH->fullSendComms == NULL ||
-        meshH->fullSendComms[peerRank] == NULL)
+    if (meshH->fullSendComms == NULL || meshH->fullSendComms[peerRank] == NULL)
       return flagcxNotSupported;
 
     return flagcxSuccess;
@@ -1405,7 +1404,8 @@ void *flagcxProxyKernelService(void *args) {
             break;
           if (comm->signalHandle == NULL) {
             WARN("flagcxDevicePrimSignal: signal handles not initialized "
-                 "for this comm — call flagcxOneSideSignalRegister() before use");
+                 "for this comm — call flagcxOneSideSignalRegister() before "
+                 "use");
             res = flagcxInternalError;
             break;
           }

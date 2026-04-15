@@ -68,26 +68,38 @@ flagcxResult_t wrapper_deviceMemcpy(void *dst, void *src, size_t size,
   return deviceAdaptor->deviceMemcpy(dst, src, size, type, stream, NULL);
 }
 
-static struct flagcxDeviceHandle globalDeviceHandle {
-  // Basic functions
-  deviceAdaptor->deviceSynchronize, wrapper_deviceMemcpy,
-      deviceAdaptor->deviceMemset, deviceAdaptor->deviceMalloc,
-      deviceAdaptor->deviceFree, deviceAdaptor->setDevice,
-      deviceAdaptor->getDevice, deviceAdaptor->getDeviceCount,
-      deviceAdaptor->getVendor, deviceAdaptor->hostGetDevicePointer,
-      // Stream functions
-      deviceAdaptor->streamCreate, deviceAdaptor->streamDestroy,
-      deviceAdaptor->streamCopy, deviceAdaptor->streamFree,
-      deviceAdaptor->streamSynchronize, deviceAdaptor->streamQuery,
-      deviceAdaptor->streamWaitEvent,
-      // Event functions
-      deviceAdaptor->eventCreate, deviceAdaptor->eventDestroy,
-      deviceAdaptor->eventRecord, deviceAdaptor->eventSynchronize,
-      deviceAdaptor->eventQuery,
-      // IpcMemHandle functions
-      deviceAdaptor->ipcMemHandleCreate, deviceAdaptor->ipcMemHandleGet,
-      deviceAdaptor->ipcMemHandleOpen, deviceAdaptor->ipcMemHandleClose,
-      deviceAdaptor->ipcMemHandleFree,
+static struct flagcxDeviceHandle globalDeviceHandle{
+    // Basic functions
+    deviceAdaptor->deviceSynchronize,
+    wrapper_deviceMemcpy,
+    deviceAdaptor->deviceMemset,
+    deviceAdaptor->deviceMalloc,
+    deviceAdaptor->deviceFree,
+    deviceAdaptor->setDevice,
+    deviceAdaptor->getDevice,
+    deviceAdaptor->getDeviceCount,
+    deviceAdaptor->getVendor,
+    deviceAdaptor->hostGetDevicePointer,
+    // Stream functions
+    deviceAdaptor->streamCreate,
+    deviceAdaptor->streamDestroy,
+    deviceAdaptor->streamCopy,
+    deviceAdaptor->streamFree,
+    deviceAdaptor->streamSynchronize,
+    deviceAdaptor->streamQuery,
+    deviceAdaptor->streamWaitEvent,
+    // Event functions
+    deviceAdaptor->eventCreate,
+    deviceAdaptor->eventDestroy,
+    deviceAdaptor->eventRecord,
+    deviceAdaptor->eventSynchronize,
+    deviceAdaptor->eventQuery,
+    // IpcMemHandle functions
+    deviceAdaptor->ipcMemHandleCreate,
+    deviceAdaptor->ipcMemHandleGet,
+    deviceAdaptor->ipcMemHandleOpen,
+    deviceAdaptor->ipcMemHandleClose,
+    deviceAdaptor->ipcMemHandleFree,
 };
 
 void flagcxRebuildGlobalDeviceHandle() {
@@ -398,7 +410,8 @@ flagcxResult_t flagcxOneSideRegister(const flagcxComm_t comm, void *buff,
 
   // First handle for this heteroComm: build a new full-mesh IB connection set
   if (isFirstHandle) {
-    FLAGCXCHECKGOTO(flagcxOneSideBuildFullMesh(heteroComm, info), res, fail_info);
+    FLAGCXCHECKGOTO(flagcxOneSideBuildFullMesh(heteroComm, info), res,
+                    fail_info);
   }
 
   // Use self recvComm for MR registration (PD match)
@@ -560,7 +573,8 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
     if (existing->baseVas != NULL &&
         existing->baseVas[comm->rank] != (uintptr_t)buff) {
       WARN("flagcxOneSideSignalRegister: comm %p already registered with a "
-           "different buffer", (void *)comm);
+           "different buffer",
+           (void *)comm);
     }
     return flagcxSuccess;
   }
@@ -593,8 +607,9 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
     firstDataHandle = heteroComm->oneSideHandles[0];
   }
   if (firstDataHandle == NULL) {
-    INFO(FLAGCX_REG, "flagcxOneSideSignalRegister: no full-mesh connections for "
-                     "this heteroComm, register a data buffer first");
+    INFO(FLAGCX_REG,
+         "flagcxOneSideSignalRegister: no full-mesh connections for "
+         "this heteroComm, register a data buffer first");
     return flagcxNotSupported;
   }
 
@@ -604,7 +619,8 @@ flagcxResult_t flagcxOneSideSignalRegister(const flagcxComm_t comm, void *buff,
   void *regComm = NULL;
   struct flagcxOneSideHandleInfo *info = NULL;
 
-  // Use self recvComm from this comm's first data handle for MR registration (PD match)
+  // Use self recvComm from this comm's first data handle for MR registration
+  // (PD match)
   void *selfRecvComm = firstDataHandle->fullRecvComms[state->rank];
   regComm = selfRecvComm;
   if (heteroComm->netAdaptor->name &&
@@ -673,7 +689,8 @@ fail_mr:
   return res;
 }
 
-flagcxResult_t flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm) {
+flagcxResult_t
+flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm) {
   if (heteroComm == NULL)
     return flagcxInternalError;
   struct flagcxOneSideHandleInfo *info = heteroComm->signalHandle;
@@ -708,13 +725,13 @@ flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
   }
 
   // Per-heteroComm dedup
-  struct flagcxOneSideHandleInfo *existingStg =
-      comm->heteroComm->stagingHandle;
+  struct flagcxOneSideHandleInfo *existingStg = comm->heteroComm->stagingHandle;
   if (existingStg != NULL) {
     if (existingStg->baseVas != NULL &&
         existingStg->baseVas[comm->rank] != (uintptr_t)buff) {
       WARN("flagcxOneSideStagingRegister: comm %p already registered with a "
-           "different buffer", (void *)comm);
+           "different buffer",
+           (void *)comm);
     }
     return flagcxSuccess;
   }
@@ -742,8 +759,9 @@ flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
     firstDataHandleStg = heteroComm->oneSideHandles[0];
   }
   if (firstDataHandleStg == NULL) {
-    INFO(FLAGCX_REG, "flagcxOneSideStagingRegister: no full-mesh connections for "
-                     "this heteroComm, register a data buffer first");
+    INFO(FLAGCX_REG,
+         "flagcxOneSideStagingRegister: no full-mesh connections for "
+         "this heteroComm, register a data buffer first");
     return flagcxNotSupported;
   }
 
@@ -753,7 +771,8 @@ flagcxResult_t flagcxOneSideStagingRegister(const flagcxComm_t comm, void *buff,
   void *regComm = NULL;
   struct flagcxOneSideHandleInfo *info = NULL;
 
-  // Use self recvComm from this comm's first data handle for MR registration (PD match)
+  // Use self recvComm from this comm's first data handle for MR registration
+  // (PD match)
   void *selfRecvComm = firstDataHandleStg->fullRecvComms[state->rank];
   regComm = selfRecvComm;
   if (heteroComm->netAdaptor->name &&

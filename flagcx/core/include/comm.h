@@ -236,7 +236,7 @@ struct flagcxHeteroComm {
   struct P2pSchedulePair {
     int sendRank;
     int recvRank;
-  } * p2pSchedule;
+  } *p2pSchedule;
 
   // Should this comm allocate LL buffers for network P2P connections?
   bool allocP2pNetLLBuffers;

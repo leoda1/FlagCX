@@ -154,8 +154,7 @@ static void *flagcxRmaProgressThread(void *arg) {
           break;
 
         case FLAGCX_RMA_PUT_VALUE: {
-          struct flagcxOneSideHandleInfo *stagingH =
-              comm->stagingHandle;
+          struct flagcxOneSideHandleInfo *stagingH = comm->stagingHandle;
           if (stagingH == NULL || stagingH->baseVas == NULL) {
             WARN("flagcxRmaProgressThread: staging handles not initialized");
             res = flagcxInternalError;

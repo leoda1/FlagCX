@@ -259,11 +259,12 @@ struct flagcxDevCommRequirements {
 
 #define FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER                               \
   {                                                                            \
-    false,       /* intraMulticast */                                          \
-        0, 0, 0, /* barrierCount, intraBarrierCount, interBarrierCount */      \
-        0, 0,    /* intraLLA2ABlockCount, intraLLA2ASlotCount */               \
-        false, 4, 0, 0 /* interForceEnable, interContextCount,                 \
-                          interSignalCount, interCounterCount */               \
+      false,       /* intraMulticast */                                        \
+      0,     0, 0, /* barrierCount, intraBarrierCount, interBarrierCount */    \
+      0,     0,    /* intraLLA2ABlockCount, intraLLA2ASlotCount */             \
+      false, 4, 0,                                                             \
+      0 /* interForceEnable, interContextCount,                                \
+           interSignalCount, interCounterCount */                              \
   }
 
 // Network type enumeration (maps to ncclGinType_t on NVIDIA backend).
@@ -439,7 +440,8 @@ flagcxResult_t flagcxOneSideDeregister(struct flagcxHeteroComm *heteroComm);
 // Release signal buffer resources (MR, network connections, handle arrays).
 // flagcxOneSideSignalRegister / flagcxOneSideStagingRegister /
 // flagcxOneSideStagingDeregister are declared in flagcx.h (extern "C").
-flagcxResult_t flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm);
+flagcxResult_t
+flagcxOneSideSignalDeregister(struct flagcxHeteroComm *heteroComm);
 
 // One-sided barrier MR registration (host-pinned memory for inter-node
 // barrier). Collective: ALL ranks must call. Leaders pass recvComm+buff,
