@@ -172,10 +172,19 @@ static void *flagcxRmaProgressThread(void *arg) {
       }
 
       if (res != flagcxSuccess) {
-        WARN("flagcxRmaProgressThread: op failed peer=%d type=%d res=%d", p,
-             (int)desc->type, (int)res);
-        __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
-        free(desc);
+        if (res == flagcxInternalError) {
+          // Request pool exhausted — put desc back to pending for retry
+          INFO(FLAGCX_ALL,
+               "flagcxRmaProgressThread: request pool full, "
+               "re-enqueue peer=%d type=%d",
+                p, (int)desc->type);
+          enqueuePending(proxy, desc);
+        } else {
+          WARN("flagcxRmaProgressThread: op failed peer=%d type=%d res=%d", p,
+               (int)desc->type, (int)res);
+          __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
+          free(desc);
+        }
       } else {
         // Enqueue to inProgress for later polling.
         if (proxy->inProgressTail != NULL) {
