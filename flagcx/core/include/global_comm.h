@@ -87,7 +87,7 @@ struct flagcxComm {
   struct C2cSchedulePair {
     int sendCluster;
     int recvCluster;
-  } *c2cSchedule; // C2C schedule for pairing send/recv operations
+  } * c2cSchedule; // C2C schedule for pairing send/recv operations
 
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];

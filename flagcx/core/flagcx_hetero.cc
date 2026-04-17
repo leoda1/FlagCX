@@ -177,7 +177,7 @@ static void *flagcxRmaProgressThread(void *arg) {
           INFO(FLAGCX_ALL,
                "flagcxRmaProgressThread: request pool full, "
                "re-enqueue peer=%d type=%d",
-                p, (int)desc->type);
+               p, (int)desc->type);
           enqueuePending(proxy, desc);
         } else {
           WARN("flagcxRmaProgressThread: op failed peer=%d type=%d res=%d", p,
