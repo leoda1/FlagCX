@@ -259,12 +259,11 @@ struct flagcxDevCommRequirements {
 
 #define FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER                               \
   {                                                                            \
-      false,       /* intraMulticast */                                        \
-      0,     0, 0, /* barrierCount, intraBarrierCount, interBarrierCount */    \
-      0,     0,    /* intraLLA2ABlockCount, intraLLA2ASlotCount */             \
-      false, 4, 0,                                                             \
-      0 /* interForceEnable, interContextCount,                                \
-           interSignalCount, interCounterCount */                              \
+    false,       /* intraMulticast */                                          \
+        0, 0, 0, /* barrierCount, intraBarrierCount, interBarrierCount */      \
+        0, 0,    /* intraLLA2ABlockCount, intraLLA2ASlotCount */               \
+        false, 4, 0, 0 /* interForceEnable, interContextCount,                 \
+                          interSignalCount, interCounterCount */               \
   }
 
 // Network type enumeration (maps to ncclGinType_t on NVIDIA backend).

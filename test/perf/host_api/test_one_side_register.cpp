@@ -1,7 +1,7 @@
+#include "comm.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "flagcx_net.h"
-#include "comm.h"
 #include "tools.h"
 
 #include <algorithm>
@@ -21,8 +21,8 @@ void fatal(flagcxResult_t res, const char *msg, int rank) {
   }
 }
 
-void warmupConnect(flagcxComm_t comm, flagcxDeviceHandle_t devHandle,
-                  int proc, int totalProcs) {
+void warmupConnect(flagcxComm_t comm, flagcxDeviceHandle_t devHandle, int proc,
+                   int totalProcs) {
   flagcxStream_t stream;
   devHandle->streamCreate(&stream);
   void *dummyBuff = nullptr;
@@ -40,12 +40,10 @@ void warmupConnect(flagcxComm_t comm, flagcxDeviceHandle_t devHandle,
 }
 
 bool doPutRound(flagcxComm_t comm, flagcxDeviceHandle_t devHandle,
-                void *dataWindow, void *signalWindow,
-                void *hostStaging, size_t size,
-                size_t signalOffset, size_t dataOffset,
-                uint64_t signalValue,
-                int proc, int senderRank, int receiverRank,
-                flagcxStream_t waitStream) {
+                void *dataWindow, void *signalWindow, void *hostStaging,
+                size_t size, size_t signalOffset, size_t dataOffset,
+                uint64_t signalValue, int proc, int senderRank,
+                int receiverRank, flagcxStream_t waitStream) {
   flagcxResult_t res;
   if (proc == senderRank) {
     uint8_t fillVal = (uint8_t)(signalValue & 0xff);
@@ -60,8 +58,8 @@ bool doPutRound(flagcxComm_t comm, flagcxDeviceHandle_t devHandle,
       return false;
     }
   } else {
-    res =
-        flagcxWaitSignal(comm, senderRank, signalOffset, signalValue, waitStream);
+    res = flagcxWaitSignal(comm, senderRank, signalOffset, signalValue,
+                           waitStream);
     if (res != flagcxSuccess) {
       fprintf(stderr, "[rank %d] flagcxWaitSignal failed (err=%d)\n", proc,
               int(res));
@@ -78,9 +76,9 @@ int main(int argc, char *argv[]) {
   parser args(argc, argv);
   size_t minBytes = args.getMinBytes();
   size_t maxBytes = args.getMaxBytes();
-  int stepFactor   = args.getStepFactor();
-  int numWarmup    = args.getWarmupIters();
-  int numIters     = args.getTestIters();
+  int stepFactor = args.getStepFactor();
+  int numWarmup = args.getWarmupIters();
+  int numIters = args.getTestIters();
   int localRegister = args.getLocalRegister();
 
   if (localRegister < 1) {
@@ -112,12 +110,13 @@ int main(int argc, char *argv[]) {
   devHandle->getDeviceCount(&nGpu);
   devHandle->setDevice(worldRank % nGpu);
 
-  const int senderRank   = 0;
+  const int senderRank = 0;
   const int receiverRank = 1;
 
   flagcxUniqueId_t uid1 = NULL;
   flagcxCalloc(&uid1, 1);
-  if (proc == 0) flagcxGetUniqueId(&uid1);
+  if (proc == 0)
+    flagcxGetUniqueId(&uid1);
   MPI_Bcast((void *)uid1, sizeof(flagcxUniqueId), MPI_BYTE, 0, splitComm);
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -127,7 +126,8 @@ int main(int argc, char *argv[]) {
 
   flagcxUniqueId_t uid2 = NULL;
   flagcxCalloc(&uid2, 1);
-  if (proc == 0) flagcxGetUniqueId(&uid2);
+  if (proc == 0)
+    flagcxGetUniqueId(&uid2);
   MPI_Bcast((void *)uid2, sizeof(flagcxUniqueId), MPI_BYTE, 0, splitComm);
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -141,22 +141,22 @@ int main(int argc, char *argv[]) {
   if (proc == 0)
     printf("[test] comm1=%p  comm2=%p\n", (void *)comm1, (void *)comm2);
 
-  size_t signalBytes      = sizeof(uint64_t);
-  size_t totalIters       = (size_t)(numWarmup + numIters);
-  size_t dataBytes        = maxBytes * std::max(numWarmup, numIters);
+  size_t signalBytes = sizeof(uint64_t);
+  size_t totalIters = (size_t)(numWarmup + numIters);
+  size_t dataBytes = maxBytes * std::max(numWarmup, numIters);
   size_t signalTotalBytes = signalBytes * totalIters;
 
   void *dataWin1 = nullptr, *sigWin1 = nullptr;
   fatal(flagcxMemAlloc(&dataWin1, dataBytes), "MemAlloc dataWin1", proc);
   fatal(flagcxMemAlloc(&sigWin1, signalTotalBytes), "MemAlloc sigWin1", proc);
   devHandle->deviceMemset(dataWin1, 0, dataBytes, flagcxMemDevice, NULL);
-  devHandle->deviceMemset(sigWin1,  0, signalTotalBytes, flagcxMemDevice, NULL);
+  devHandle->deviceMemset(sigWin1, 0, signalTotalBytes, flagcxMemDevice, NULL);
 
   void *dataWin2 = nullptr, *sigWin2 = nullptr;
   fatal(flagcxMemAlloc(&dataWin2, dataBytes), "MemAlloc dataWin2", proc);
   fatal(flagcxMemAlloc(&sigWin2, signalTotalBytes), "MemAlloc sigWin2", proc);
   devHandle->deviceMemset(dataWin2, 0, dataBytes, flagcxMemDevice, NULL);
-  devHandle->deviceMemset(sigWin2,  0, signalTotalBytes, flagcxMemDevice, NULL);
+  devHandle->deviceMemset(sigWin2, 0, signalTotalBytes, flagcxMemDevice, NULL);
 
   flagcxResult_t r1 = flagcxOneSideRegister(comm1, dataWin1, dataBytes);
   if (r1 == flagcxNotSupported) {
@@ -180,7 +180,7 @@ int main(int argc, char *argv[]) {
 
   fatal(flagcxOneSideSignalRegister(comm1, sigWin1, signalTotalBytes,
                                     FLAGCX_PTR_CUDA),
-            "SignalRegister (comm1)", proc);
+        "SignalRegister (comm1)", proc);
   fatal(flagcxOneSideSignalRegister(comm2, sigWin2, signalTotalBytes,
                                     FLAGCX_PTR_CUDA),
         "SignalRegister (comm2)", proc);
@@ -204,20 +204,21 @@ int main(int argc, char *argv[]) {
                                : flagcxInternalError),
           "posix_memalign", proc);
 
-    if (proc == 0) printf("\n[Phase 1] put via comm1\n");
+    if (proc == 0)
+      printf("\n[Phase 1] put via comm1\n");
     for (size_t size = minBytes; size <= maxBytes; size *= stepFactor) {
-      devHandle->deviceMemset(sigWin1, 0, signalTotalBytes, flagcxMemDevice, NULL);
+      devHandle->deviceMemset(sigWin1, 0, signalTotalBytes, flagcxMemDevice,
+                              NULL);
       MPI_Barrier(MPI_COMM_WORLD);
 
       for (int i = 0; i < numWarmup + numIters; i++) {
         size_t signalOffset = (size_t)i * signalBytes;
-        size_t dataOffset   = (size_t)(i % std::max(numWarmup, numIters)) * size;
-        uint64_t sigVal     = (uint64_t)(i + 1);
+        size_t dataOffset = (size_t)(i % std::max(numWarmup, numIters)) * size;
+        uint64_t sigVal = (uint64_t)(i + 1);
 
-        bool ok = doPutRound(comm1, devHandle, dataWin1, sigWin1,
-                             hostStaging, size, signalOffset, dataOffset,
-                             sigVal, proc, senderRank, receiverRank,
-                             waitStream);
+        bool ok = doPutRound(comm1, devHandle, dataWin1, sigWin1, hostStaging,
+                             size, signalOffset, dataOffset, sigVal, proc,
+                             senderRank, receiverRank, waitStream);
         if (!ok) {
           fprintf(stderr, "[rank %d] Phase 1 FAILED at iter %d size %zu\n",
                   proc, i, size);
@@ -230,20 +231,21 @@ int main(int argc, char *argv[]) {
         printf("[Phase 1] size=%zu PASS\n", size);
     }
 
-    if (proc == 0) printf("\n[Phase 2] put via comm2\n");
+    if (proc == 0)
+      printf("\n[Phase 2] put via comm2\n");
     for (size_t size = minBytes; size <= maxBytes; size *= stepFactor) {
-      devHandle->deviceMemset(sigWin2, 0, signalTotalBytes, flagcxMemDevice, NULL);
+      devHandle->deviceMemset(sigWin2, 0, signalTotalBytes, flagcxMemDevice,
+                              NULL);
       MPI_Barrier(MPI_COMM_WORLD);
 
       for (int i = 0; i < numWarmup + numIters; i++) {
         size_t signalOffset = (size_t)i * signalBytes;
-        size_t dataOffset   = (size_t)(i % std::max(numWarmup, numIters)) * size;
-        uint64_t sigVal     = (uint64_t)(i + 1);
+        size_t dataOffset = (size_t)(i % std::max(numWarmup, numIters)) * size;
+        uint64_t sigVal = (uint64_t)(i + 1);
 
-        bool ok = doPutRound(comm2, devHandle, dataWin2, sigWin2,
-                             hostStaging, size, signalOffset, dataOffset,
-                             sigVal, proc, senderRank, receiverRank,
-                             waitStream);
+        bool ok = doPutRound(comm2, devHandle, dataWin2, sigWin2, hostStaging,
+                             size, signalOffset, dataOffset, sigVal, proc,
+                             senderRank, receiverRank, waitStream);
         if (!ok) {
           fprintf(stderr, "[rank %d] Phase 2 FAILED at iter %d size %zu\n",
                   proc, i, size);
@@ -256,27 +258,29 @@ int main(int argc, char *argv[]) {
         printf("[Phase 2] size=%zu PASS\n", size);
     }
 
-    if (proc == 0) printf("\n[Phase 3] deregister comm1, then put via comm2\n");
+    if (proc == 0)
+      printf("\n[Phase 3] deregister comm1, then put via comm2\n");
 
     flagcxOneSideDeregister(comm1->heteroComm);
     flagcxOneSideSignalDeregister(comm1->heteroComm);
     MPI_Barrier(MPI_COMM_WORLD);
 
-    if (proc == 0) printf("[Phase 3] comm1 deregistered.\n");
+    if (proc == 0)
+      printf("[Phase 3] comm1 deregistered.\n");
 
     for (size_t size = minBytes; size <= maxBytes; size *= stepFactor) {
-      devHandle->deviceMemset(sigWin2, 0, signalTotalBytes, flagcxMemDevice, NULL);
+      devHandle->deviceMemset(sigWin2, 0, signalTotalBytes, flagcxMemDevice,
+                              NULL);
       MPI_Barrier(MPI_COMM_WORLD);
 
       for (int i = 0; i < numWarmup + numIters; i++) {
         size_t signalOffset = (size_t)i * signalBytes;
-        size_t dataOffset   = (size_t)(i % std::max(numWarmup, numIters)) * size;
-        uint64_t sigVal     = (uint64_t)(i + 1);
+        size_t dataOffset = (size_t)(i % std::max(numWarmup, numIters)) * size;
+        uint64_t sigVal = (uint64_t)(i + 1);
 
-        bool ok = doPutRound(comm2, devHandle, dataWin2, sigWin2,
-                             hostStaging, size, signalOffset, dataOffset,
-                             sigVal, proc, senderRank, receiverRank,
-                             waitStream);
+        bool ok = doPutRound(comm2, devHandle, dataWin2, sigWin2, hostStaging,
+                             size, signalOffset, dataOffset, sigVal, proc,
+                             senderRank, receiverRank, waitStream);
         if (!ok) {
           fprintf(stderr,
                   "[rank %d] Phase 3 FAILED at iter %d size %zu "
@@ -288,15 +292,17 @@ int main(int argc, char *argv[]) {
 
       MPI_Barrier(MPI_COMM_WORLD);
       if (proc == 0)
-        printf("[Phase 3] size=%zu PASS (comm2 unaffected by comm1 deregister)\n",
-               size);
+        printf(
+            "[Phase 3] size=%zu PASS (comm2 unaffected by comm1 deregister)\n",
+            size);
     }
 
     if (proc == 0)
       printf("\n[test_multi_comm_put] ALL PHASES PASSED\n");
 
     free(hostStaging);
-    if (waitStream) devHandle->streamDestroy(waitStream);
+    if (waitStream)
+      devHandle->streamDestroy(waitStream);
 
     flagcxOneSideDeregister(comm2->heteroComm);
     flagcxOneSideSignalDeregister(comm2->heteroComm);
