@@ -492,11 +492,11 @@ class FlagCXBenchmark(TransportBenchmark):
             self.buffer.numel() * self.buffer.element_size()
         )
 
-        # Allocate and register signal buffer
-        self.signal_buffer = torch.zeros(1, device=dev, dtype=torch.int64)
+        # Allocate and register signal buffer (CPU pinned memory, ptrType=1=FLAGCX_PTR_HOST)
+        self.signal_buffer = torch.zeros(1, dtype=torch.int64).pin_memory()
         self.flagcx.flagcxOneSideSignalRegister(
             self.comm, self.signal_buffer.data_ptr(),
-            self.signal_buffer.numel() * self.signal_buffer.element_size(), 0
+            self.signal_buffer.numel() * self.signal_buffer.element_size(), 1
         )
 
         # Sync ready
@@ -519,11 +519,14 @@ class FlagCXBenchmark(TransportBenchmark):
         block_size = self._total_bytes // self._num_blocks
 
         if rank == 1:  # client
+            before = self.flagcx.flagcxReadCounter(self.comm)
             if self._num_blocks == 1:
                 self.flagcx.flagcxPut(
                     self.comm, peer, 0, 0, self._total_bytes, 0, 0
                 )
+                n_ops = 1
             else:
+                block_size = self._total_bytes // self._num_blocks
                 offsets = [i * block_size for i in range(self._num_blocks)]
                 sizes = [block_size] * self._num_blocks
                 mr_idxs = [0] * self._num_blocks
@@ -531,9 +534,12 @@ class FlagCXBenchmark(TransportBenchmark):
                     self.comm, peer, offsets, offsets, sizes,
                     mr_idxs, mr_idxs
                 )
-            self.flagcx.flagcxSignal(self.comm, peer, 0, self.counter)
+                n_ops = self._num_blocks
+            self.flagcx.flagcxWaitCounter(self.comm, before + n_ops)
+            self.zmq_sock.send(b"DONE")
         else:  # server waits
-            self.flagcx.flagcxWaitCounter(self.comm, self.counter)
+            while self.zmq_sock.recv() != b"DONE":
+                    pass
 
     def verify_strict(self) -> None:
         """Strict element-by-element verification. Raises on mismatch."""
@@ -698,7 +704,7 @@ def main() -> None:
         help="NIXL backend plugin (UCX, UCCL, FLAGCX, etc.)"
     )
     p.add_argument(
-        "--zmq-port", type=int, default=9000,
+        "--zmq-port", type=int, default=4566,
         help="ZMQ coordination port"
     )
     p.add_argument(
