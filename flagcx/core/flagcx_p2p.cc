@@ -12,6 +12,7 @@
 #include "flagcx_p2p.h"
 
 #include "adaptor.h"
+#include "debug.h"
 #include "flagcx_net.h"
 #include "flagcx_net_adaptor.h"
 #include "ib_common.h"
@@ -174,6 +175,7 @@ static std::vector<FlagcxP2pNotifyMsg> gNotifyList;
 static std::mutex gNotifyMutex;
 
 static std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry> gMemRegInfo;
+static std::unordered_map<FlagcxP2pMr, uintptr_t> gMrToBaseAddr;
 static std::mutex gMemMutex;
 static uint64_t gNextMrId = 1;
 
@@ -374,13 +376,26 @@ static bool findMemReg(uintptr_t addr, FlagcxP2pMemRegEntry *out) {
 }
 
 static FlagcxP2pMemRegEntry *findMemRegByMr(FlagcxP2pMr mr) {
-  for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator it =
-           gMemRegInfo.begin();
-       it != gMemRegInfo.end(); ++it) {
-    if (it->second.mrId == mr)
-      return &it->second;
-  }
+  std::unordered_map<FlagcxP2pMr, uintptr_t>::const_iterator mrIt =
+      gMrToBaseAddr.find(mr);
+  if (mrIt == gMrToBaseAddr.end())
+    return NULL;
+
+  std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator entryIt =
+      gMemRegInfo.find(mrIt->second);
+  if (entryIt != gMemRegInfo.end())
+    return &entryIt->second;
+
   return NULL;
+}
+
+static bool memRegContains(const FlagcxP2pMemRegEntry &entry, uintptr_t addr,
+                           size_t size) {
+  if (addr < entry.baseAddr)
+    return false;
+
+  const uintptr_t offset = addr - entry.baseAddr;
+  return offset <= entry.size && size <= entry.size - offset;
 }
 
 static int resolveIbDevN(int netDev) {
@@ -1113,6 +1128,7 @@ void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
       engine->adaptor->deregMr(&devCtx, it->second.mhandle);
     }
     gMemRegInfo.clear();
+    gMrToBaseAddr.clear();
   }
 
   if (engine->topoMgr) {
@@ -1308,6 +1324,7 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
       gMemRegInfo.find(data);
   if (existing != gMemRegInfo.end()) {
     mrId = existing->second.mrId;
+    gMrToBaseAddr[mrId] = existing->first;
     return 0;
   }
 
@@ -1337,6 +1354,7 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
   }
 
   gMemRegInfo[data] = entry;
+  gMrToBaseAddr[entry.mrId] = data;
   mrId = entry.mrId;
   return 0;
 }
@@ -1346,18 +1364,24 @@ void flagcxP2pEngineMrDestroy(FlagcxP2pEngine *engine, FlagcxP2pMr mr) {
     return;
 
   std::lock_guard<std::mutex> lock(gMemMutex);
-  for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator it =
-           gMemRegInfo.begin();
-       it != gMemRegInfo.end(); ++it) {
-    if (it->second.mrId == mr) {
-      struct {
-        int ibDevN;
-      } devCtx = {it->second.ibDevN};
-      engine->adaptor->deregMr(&devCtx, it->second.mhandle);
-      gMemRegInfo.erase(it);
-      return;
-    }
+  std::unordered_map<FlagcxP2pMr, uintptr_t>::iterator mrIt =
+      gMrToBaseAddr.find(mr);
+  if (mrIt == gMrToBaseAddr.end())
+    return;
+
+  std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator entryIt =
+      gMemRegInfo.find(mrIt->second);
+  if (entryIt == gMemRegInfo.end()) {
+    gMrToBaseAddr.erase(mrIt);
+    return;
   }
+
+  struct {
+    int ibDevN;
+  } devCtx = {entryIt->second.ibDevN};
+  engine->adaptor->deregMr(&devCtx, entryIt->second.mhandle);
+  gMemRegInfo.erase(entryIt);
+  gMrToBaseAddr.erase(mrIt);
 }
 
 int flagcxP2pEnginePrepareDesc(FlagcxP2pEngine *engine, FlagcxP2pMr mr,
@@ -1457,22 +1481,73 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
                               std::vector<FlagcxP2pRdmaDesc> descs, int numIovs,
                               uint64_t *transferId,
                               std::vector<char *> ipcBufs) {
-  (void)mrIds;
-  if (conn == NULL || numIovs <= 0 || transferId == NULL)
+  if (conn == NULL || numIovs <= 0 || transferId == NULL) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: invalid args (conn=%p, "
+            "numIovs=%d, transferId=%p)\n",
+            conn, numIovs, (void *)transferId);
     return -1;
+  }
+
+  if (dstVec.size() < static_cast<size_t>(numIovs) ||
+      sizeVec.size() < static_cast<size_t>(numIovs) ||
+      descs.size() < static_cast<size_t>(numIovs)) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: vector length mismatch "
+            "(numIovs=%d)\n",
+            numIovs);
+    return -1;
+  }
 
   if (conn->isLocal && (conn->sameProcess || !ipcBufs.empty())) {
-    return startLocalTransfer(conn, dstVec, sizeVec, descs, numIovs, transferId,
-                              ipcBufs, false);
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector taking local transfer path: numIovs=%d\n",
+            numIovs);
+    int rc = startLocalTransfer(conn, dstVec, sizeVec, descs, numIovs,
+                                transferId, ipcBufs, false);
+    fprintf(stderr, "[FlagCX P2P] ReadVector local transfer returned: rc=%d\n",
+            rc);
+    return rc;
+  }
+
+  if (mrIds.size() < static_cast<size_t>(numIovs)) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: mrIds length mismatch "
+            "(numIovs=%d)\n",
+            numIovs);
+    return -1;
   }
 
   std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
   {
+    auto t0 = std::chrono::high_resolution_clock::now();
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
-      if (!findMemReg((uintptr_t)dstVec[i], &localEntries[i]))
+      FlagcxP2pMemRegEntry *entry = findMemRegByMr(mrIds[i]);
+      if (entry == NULL) {
+        fprintf(
+            stderr,
+            "[FlagCX P2P] ReadVector memReg lookup failed: iov=%d, mr=%lu\n", i,
+            (unsigned long)mrIds[i]);
         return -1;
+      }
+
+      if (!memRegContains(*entry, reinterpret_cast<uintptr_t>(dstVec[i]),
+                          sizeVec[i])) {
+        fprintf(stderr,
+                "[FlagCX P2P] ReadVector memReg bounds check failed: iov=%d, "
+                "mr=%lu, addr=%p, size=%zu\n",
+                i, (unsigned long)mrIds[i], dstVec[i], sizeVec[i]);
+        return -1;
+      }
+
+      localEntries[i] = *entry;
     }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector memReg lookup: numIovs=%d, time=%.4f ms\n",
+            numIovs, ms);
   }
 
   ensureAsyncWorkerStarted();
@@ -1501,6 +1576,10 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
   pthread_cond_signal(&gAsyncWorker.cv);
 
   *transferId = xferId;
+  fprintf(
+      stderr,
+      "[FlagCX P2P] ReadVector submitted async task: xferId=%lu, numIovs=%d\n",
+      (unsigned long)xferId, numIovs);
   return 0;
 }
 
