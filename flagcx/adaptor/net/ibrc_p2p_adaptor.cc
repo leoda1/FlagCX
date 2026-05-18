@@ -72,6 +72,7 @@ struct flagcxP2pConnMeta {
 #define FLAGCX_P2P_REQ_UNUSED 0
 #define FLAGCX_P2P_REQ_IPUT 1
 #define FLAGCX_P2P_REQ_IGET 2
+#define FLAGCX_P2P_BATCH_POLL_SIZE 32
 
 struct flagcxP2pRequest {
   int type;
@@ -672,6 +673,88 @@ static flagcxResult_t flagcxP2pTest(void *request, int *done, int *sizes) {
   return flagcxSuccess;
 }
 
+static flagcxResult_t flagcxP2pTestBatch(void **requests, int nRequests,
+                                         int *doneFlags, int *doneCount) {
+  if (nRequests == 0) {
+    *doneCount = 0;
+    return flagcxSuccess;
+  }
+
+  // Initialize all done flags to 0
+  for (int i = 0; i < nRequests; i++) {
+    doneFlags[i] = 0;
+  }
+
+  // Get CQ from first valid request (all requests share the same CQ)
+  struct ibv_cq *cq = nullptr;
+  struct flagcxP2pRequest *baseReqs = nullptr;
+  for (int i = 0; i < nRequests; i++) {
+    struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)requests[i];
+    if (req != nullptr && req->type != FLAGCX_P2P_REQ_UNUSED) {
+      cq = req->cq;
+      baseReqs = req->reqs;
+      break;
+    }
+  }
+
+  if (cq == nullptr) {
+    // All requests are NULL or already done
+    int completed = 0;
+    for (int i = 0; i < nRequests; i++) {
+      struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)requests[i];
+      if (req == nullptr || req->type == FLAGCX_P2P_REQ_UNUSED) {
+        doneFlags[i] = 1;
+        completed++;
+      }
+    }
+    *doneCount = completed;
+    return flagcxSuccess;
+  }
+
+  // Batch poll the CQ
+  struct ibv_wc wcs[FLAGCX_P2P_BATCH_POLL_SIZE];
+  int nCqe = 0;
+  FLAGCXCHECK(flagcxWrapIbvPollCq(cq, FLAGCX_P2P_BATCH_POLL_SIZE, wcs, &nCqe));
+
+  int completed = 0;
+
+  // Process all returned completions
+  for (int w = 0; w < nCqe; w++) {
+    struct ibv_wc *wc = &wcs[w];
+
+    if (wc->status != IBV_WC_SUCCESS) {
+      WARN("NET/IB_P2P : CQ error: status=%d opcode=%d wr_id=%lu", wc->status,
+           wc->opcode, wc->wr_id);
+      return flagcxRemoteError;
+    }
+
+    // Map CQE back to request via wr_id
+    uint32_t reqIdx = wc->wr_id;
+    if (reqIdx >= FLAGCX_P2P_MAX_REQUESTS) {
+      WARN("NET/IB_P2P : invalid wr_id %u in CQE", reqIdx);
+      return flagcxInternalError;
+    }
+    struct flagcxP2pRequest *completedReq = &baseReqs[reqIdx];
+
+    completedReq->events--;
+    if (completedReq->events == 0) {
+      completedReq->type = FLAGCX_P2P_REQ_UNUSED;
+
+      // Check if this completion matches any of our requested requests
+      for (int i = 0; i < nRequests; i++) {
+        if (requests[i] == completedReq) {
+          doneFlags[i] = 1;
+          completed++;
+          break;
+        }
+      }
+    }
+  }
+
+  *doneCount = completed;
+  return flagcxSuccess;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Close                                                              */
 /* ------------------------------------------------------------------ */
@@ -793,20 +876,39 @@ static flagcxResult_t flagcxP2pGetDevFromName(char *name, int *dev) {
 
 struct flagcxNetAdaptor flagcxNetIbP2p = {
     // Basic functions
-    "IB_P2P", flagcxP2pInit, flagcxP2pDevices, flagcxP2pGetProperties,
+    "IB_P2P",
+    flagcxP2pInit,
+    flagcxP2pDevices,
+    flagcxP2pGetProperties,
 
     // Setup functions
-    flagcxP2pListen, flagcxP2pConnect, flagcxP2pAccept, flagcxP2pCloseSend,
-    flagcxP2pCloseRecv, flagcxP2pCloseListen,
+    flagcxP2pListen,
+    flagcxP2pConnect,
+    flagcxP2pAccept,
+    flagcxP2pCloseSend,
+    flagcxP2pCloseRecv,
+    flagcxP2pCloseListen,
 
     // Memory region functions
-    flagcxP2pRegMr, flagcxP2pRegMrDmaBuf, flagcxP2pDeregMr,
+    flagcxP2pRegMr,
+    flagcxP2pRegMrDmaBuf,
+    flagcxP2pDeregMr,
 
     // Two-sided functions (stubs)
-    flagcxP2pIsend, flagcxP2pIrecv, flagcxP2pIflush, flagcxP2pTest,
+    flagcxP2pIsend,
+    flagcxP2pIrecv,
+    flagcxP2pIflush,
+    flagcxP2pTest,
 
     // One-sided functions
-    flagcxP2pIput, flagcxP2pIget, flagcxP2pIputSignal,
+    flagcxP2pIput,
+    flagcxP2pIget,
+    flagcxP2pIputSignal,
 
     // Device name lookup
-    flagcxP2pGetDevFromName};
+    flagcxP2pGetDevFromName,
+
+    // Optional batch operations
+    nullptr,            // iputBatch
+    flagcxP2pTestBatch, // testBatch
+};
