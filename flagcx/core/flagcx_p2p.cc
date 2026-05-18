@@ -188,7 +188,6 @@ static uint64_t gNextXferId = 1;
 /* ------------------------------------------------------------------ */
 
 static constexpr int kWindowSize = 64;
-static constexpr int kBatchPollCqe = 32;
 
 enum AsyncXferOp { ASYNC_XFER_READ, ASYNC_XFER_WRITE };
 
@@ -291,27 +290,58 @@ static void asyncWorkerFunc() {
 
       // Batch-poll completions for in-flight requests
       int newlyCompleted = 0;
-      for (int i = completed; i < issued; i++) {
-        int slot = i % kWindowSize;
-        if (inflightReqs[slot] == nullptr) {
-          if (i == completed)
-            completed++;
-          continue;
+
+      if (adaptor->testBatch != nullptr) {
+        // Collect non-null in-flight requests for batch testing
+        void *batchRequests[kWindowSize];
+        int batchIndices[kWindowSize];
+        int batchCount = 0;
+
+        for (int i = completed; i < issued; i++) {
+          int slot = i % kWindowSize;
+          if (inflightReqs[slot] != nullptr) {
+            batchRequests[batchCount] = inflightReqs[slot];
+            batchIndices[batchCount] = i;
+            batchCount++;
+          }
         }
-        int done = 0, sizes = 0;
-        flagcxResult_t res = adaptor->test(inflightReqs[slot], &done, &sizes);
-        if (res != flagcxSuccess) {
-          inflightReqs[slot] = nullptr;
-          if (i == completed)
-            completed++;
-          newlyCompleted++;
-          continue;
+
+        if (batchCount > 0) {
+          int doneFlags[kWindowSize];
+          int doneCount = 0;
+          flagcxResult_t res = adaptor->testBatch(batchRequests, batchCount,
+                                                  doneFlags, &doneCount);
+          if (res != flagcxSuccess) {
+            error = true;
+          } else {
+            for (int b = 0; b < batchCount; b++) {
+              if (doneFlags[b]) {
+                int i = batchIndices[b];
+                int slot = i % kWindowSize;
+                inflightReqs[slot] = nullptr;
+                newlyCompleted++;
+              }
+            }
+          }
         }
-        if (done) {
-          inflightReqs[slot] = nullptr;
-          if (i == completed)
-            completed++;
-          newlyCompleted++;
+      } else {
+        // Fallback: per-request polling
+        for (int i = completed; i < issued; i++) {
+          int slot = i % kWindowSize;
+          if (inflightReqs[slot] == nullptr) {
+            continue;
+          }
+          int done = 0, sizes = 0;
+          flagcxResult_t res = adaptor->test(inflightReqs[slot], &done, &sizes);
+          if (res != flagcxSuccess) {
+            inflightReqs[slot] = nullptr;
+            newlyCompleted++;
+            continue;
+          }
+          if (done) {
+            inflightReqs[slot] = nullptr;
+            newlyCompleted++;
+          }
         }
       }
 

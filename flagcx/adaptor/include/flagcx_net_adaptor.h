@@ -135,6 +135,10 @@ struct flagcxNetAdaptor_latest {
                               const size_t *sizes, int srcRank, int dstRank,
                               void **srcHandles, void **dstHandles,
                               void **requests, int *posted);
+  // Optional batch completion test — polls CQ once for multiple requests.
+  // If NULL, caller falls back to per-request test().
+  flagcxResult_t (*testBatch)(void **requests, int nRequests, int *doneFlags,
+                              int *doneCount);
 };
 
 #define flagcxNetAdaptor flagcxNetAdaptor_latest
