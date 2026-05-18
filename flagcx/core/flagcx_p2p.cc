@@ -1650,8 +1650,12 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                                std::vector<FlagcxP2pRdmaDesc> descs,
                                int numIovs, uint64_t *transferId,
                                std::vector<char *> ipcBufs) {
-  (void)mrIds;
   if (conn == NULL || numIovs <= 0 || transferId == NULL)
+    return -1;
+
+  if (dstVec.size() < static_cast<size_t>(numIovs) ||
+      sizeVec.size() < static_cast<size_t>(numIovs) ||
+      descs.size() < static_cast<size_t>(numIovs))
     return -1;
 
   if (conn->isLocal && (conn->sameProcess || !ipcBufs.empty())) {
@@ -1659,12 +1663,22 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                               ipcBufs, true);
   }
 
+  if (mrIds.size() < static_cast<size_t>(numIovs))
+    return -1;
+
   std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
   {
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
-      if (!findMemReg((uintptr_t)dstVec[i], &localEntries[i]))
+      FlagcxP2pMemRegEntry *entry = findMemRegByMr(mrIds[i]);
+      if (entry == NULL)
         return -1;
+
+      if (!memRegContains(*entry, reinterpret_cast<uintptr_t>(dstVec[i]),
+                          sizeVec[i]))
+        return -1;
+
+      localEntries[i] = *entry;
     }
   }
 
