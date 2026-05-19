@@ -15,11 +15,14 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <pthread.h>
 #include <string.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 /* ------------------------------------------------------------------ */
 /*  Internal structs                                                   */
@@ -79,6 +82,7 @@ struct flagcxP2pRequest {
   int events;                    // outstanding CQEs expected
   struct ibv_cq *cq;             // CQ to poll for this request
   struct flagcxP2pRequest *reqs; // back-pointer to owning reqs[] array
+  std::atomic<uint8_t> *reqDone; // pointer to owning comm's reqDone[] array
 };
 
 // P2P send comm — one QP, one CQ, blocking connect
@@ -90,6 +94,8 @@ struct flagcxP2pSendComm {
   struct flagcxP2pRequest reqs[FLAGCX_P2P_MAX_REQUESTS];
   uint64_t putSignalScratchpad;
   struct ibv_mr *putSignalScratchpadMr;
+  std::atomic<uint8_t> reqDone[FLAGCX_P2P_MAX_REQUESTS];
+  std::atomic<bool> cqError{false};
 };
 
 // P2P recv comm — symmetric with send comm so both sides can initiate transfers
@@ -101,6 +107,8 @@ struct flagcxP2pRecvComm {
   struct flagcxP2pRequest reqs[FLAGCX_P2P_MAX_REQUESTS];
   uint64_t putSignalScratchpad;
   struct ibv_mr *putSignalScratchpadMr;
+  std::atomic<uint8_t> reqDone[FLAGCX_P2P_MAX_REQUESTS];
+  std::atomic<bool> cqError{false};
 };
 
 /* ------------------------------------------------------------------ */
@@ -112,10 +120,127 @@ static int flagcxP2pInitialized = 0;
 static pthread_mutex_t flagcxP2pInitLock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
+/*  Background CQ Poller                                               */
+/* ------------------------------------------------------------------ */
+
+struct CqPollEntry {
+  struct ibv_cq *cq;
+  struct flagcxP2pRequest *reqs;
+  std::atomic<uint8_t> *reqDone;
+  std::atomic<bool> *cqError;
+  bool active;
+};
+
+struct CqPoller {
+  std::thread thread;
+  std::mutex mutex;
+  std::vector<CqPollEntry> entries;
+  std::atomic<bool> running{false};
+};
+
+static CqPoller gCqPoller;
+
+static void cqPollerFunc() {
+  while (gCqPoller.running.load(std::memory_order_relaxed)) {
+    std::vector<CqPollEntry> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(gCqPoller.mutex);
+      snapshot = gCqPoller.entries;
+    }
+
+    bool anyWork = false;
+    for (auto &entry : snapshot) {
+      if (!entry.active)
+        continue;
+
+      struct ibv_wc wcs[FLAGCX_P2P_BATCH_POLL_SIZE];
+      int nCqe = 0;
+      if (flagcxWrapIbvPollCq(entry.cq, FLAGCX_P2P_BATCH_POLL_SIZE, wcs,
+                              &nCqe) != flagcxSuccess) {
+        entry.cqError->store(true, std::memory_order_release);
+        continue;
+      }
+
+      for (int i = 0; i < nCqe; i++) {
+        if (wcs[i].status != IBV_WC_SUCCESS) {
+          WARN("NET/IB_P2P : CQ poller got error status %d for wr_id %lu",
+               wcs[i].status, wcs[i].wr_id);
+          entry.cqError->store(true, std::memory_order_release);
+          break;
+        }
+        uint32_t idx = (uint32_t)wcs[i].wr_id;
+        if (idx >= FLAGCX_P2P_MAX_REQUESTS)
+          continue;
+
+        entry.reqs[idx].events--;
+        if (entry.reqs[idx].events == 0) {
+          entry.reqs[idx].type = FLAGCX_P2P_REQ_UNUSED;
+          entry.reqDone[idx].store(1, std::memory_order_release);
+        }
+      }
+      if (nCqe > 0)
+        anyWork = true;
+    }
+
+    if (!anyWork) {
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
+    }
+  }
+}
+
+static void ensureCqPollerStarted() {
+  if (!gCqPoller.running.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
+    if (!gCqPoller.running.load(std::memory_order_relaxed)) {
+      gCqPoller.running.store(true, std::memory_order_release);
+      gCqPoller.thread = std::thread(cqPollerFunc);
+    }
+  }
+}
+
+static void cqPollerRegister(struct ibv_cq *cq, struct flagcxP2pRequest *reqs,
+                             std::atomic<uint8_t> *reqDone,
+                             std::atomic<bool> *cqError) {
+  ensureCqPollerStarted();
+  std::lock_guard<std::mutex> lock(gCqPoller.mutex);
+  gCqPoller.entries.push_back({cq, reqs, reqDone, cqError, true});
+}
+
+static void cqPollerStop() {
+  if (gCqPoller.running.load(std::memory_order_acquire)) {
+    gCqPoller.running.store(false, std::memory_order_release);
+    if (gCqPoller.thread.joinable()) {
+      gCqPoller.thread.join();
+    }
+    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
+    gCqPoller.entries.clear();
+  }
+}
+
+static void cqPollerUnregister(struct ibv_cq *cq) {
+  bool anyActive = false;
+  {
+    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
+    for (auto &entry : gCqPoller.entries) {
+      if (entry.cq == cq) {
+        entry.active = false;
+      } else if (entry.active) {
+        anyActive = true;
+      }
+    }
+  }
+  std::this_thread::sleep_for(std::chrono::microseconds(100));
+  if (!anyActive) {
+    cqPollerStop();
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Request helpers                                                    */
 /* ------------------------------------------------------------------ */
 
 static flagcxResult_t flagcxP2pGetRequest(struct flagcxP2pRequest *reqs,
+                                          std::atomic<uint8_t> *reqDone,
                                           struct ibv_cq *cq, int type,
                                           struct flagcxP2pRequest **req) {
   for (int i = 0; i < FLAGCX_P2P_MAX_REQUESTS; i++) {
@@ -124,6 +249,8 @@ static flagcxResult_t flagcxP2pGetRequest(struct flagcxP2pRequest *reqs,
       reqs[i].events = 0;
       reqs[i].cq = cq;
       reqs[i].reqs = reqs;
+      reqs[i].reqDone = reqDone;
+      reqDone[i].store(0, std::memory_order_relaxed);
       *req = &reqs[i];
       return flagcxSuccess;
     }
@@ -411,6 +538,8 @@ static flagcxResult_t flagcxP2pConnect(int dev, void *opaqueHandle,
   FLAGCXCHECK(flagcxSocketSend(&comm->sock, &localReady, sizeof(localReady)));
   FLAGCXCHECK(flagcxSocketRecv(&comm->sock, &remoteReady, sizeof(remoteReady)));
 
+  cqPollerRegister(comm->base.cq, comm->reqs, comm->reqDone, &comm->cqError);
+
   *sendComm = comm;
   return flagcxSuccess;
 }
@@ -469,6 +598,8 @@ static flagcxResult_t flagcxP2pAccept(void *listenComm, void **recvComm) {
   FLAGCXCHECK(flagcxSocketRecv(&comm->sock, &remoteReady, sizeof(remoteReady)));
   FLAGCXCHECK(flagcxSocketSend(&comm->sock, &localReady, sizeof(localReady)));
 
+  cqPollerRegister(comm->base.cq, comm->reqs, comm->reqDone, &comm->cqError);
+
   *recvComm = comm;
   return flagcxSuccess;
 }
@@ -486,7 +617,7 @@ static flagcxResult_t flagcxP2pIput(void *sendComm, uint64_t srcOff,
   struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
 
   struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->base.cq,
+  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, comm->base.cq,
                                   FLAGCX_P2P_REQ_IPUT, &req));
 
   struct ibv_sge sge;
@@ -527,7 +658,7 @@ static flagcxResult_t flagcxP2pIget(void *sendComm, uint64_t srcOff,
   struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
 
   struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->base.cq,
+  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, comm->base.cq,
                                   FLAGCX_P2P_REQ_IGET, &req));
 
   struct ibv_sge sge;
@@ -569,7 +700,7 @@ flagcxP2pIputSignal(void *sendComm, uint64_t srcOff, uint64_t dstOff,
       (struct flagcxP2pMrHandle *)signalHandles;
 
   struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->base.cq,
+  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, comm->base.cq,
                                   FLAGCX_P2P_REQ_IPUT, &req));
 
   bool chainData = (size > 0 && srcHandles != NULL && dstHandles != NULL);
@@ -638,34 +769,14 @@ static flagcxResult_t flagcxP2pTest(void *request, int *done, int *sizes) {
     return flagcxSuccess;
   }
 
-  int nCqe = 0;
-  struct ibv_wc wc;
-  FLAGCXCHECK(flagcxWrapIbvPollCq(req->cq, 1, &wc, &nCqe));
-
-  if (nCqe == 0)
-    return flagcxSuccess;
-
-  if (wc.status != IBV_WC_SUCCESS) {
-    WARN("NET/IB_P2P : CQ error: status=%d opcode=%d wr_id=%lu", wc.status,
-         wc.opcode, wc.wr_id);
-    return flagcxRemoteError;
-  }
-
-  // Map CQE back to the correct request via wr_id
-  uint32_t reqIdx = wc.wr_id;
-  if (reqIdx >= FLAGCX_P2P_MAX_REQUESTS) {
-    WARN("NET/IB_P2P : invalid wr_id %u in CQE", reqIdx);
+  uint32_t idx = (uint32_t)(req - req->reqs);
+  if (idx >= FLAGCX_P2P_MAX_REQUESTS) {
+    WARN("NET/IB_P2P : invalid request index %u in test()", idx);
     return flagcxInternalError;
   }
-  struct flagcxP2pRequest *completedReq = &req->reqs[reqIdx];
 
-  completedReq->events--;
-  if (completedReq->events == 0) {
-    completedReq->type = FLAGCX_P2P_REQ_UNUSED;
-  }
-
-  // Check if the originally requested op is done
-  if (req->type == FLAGCX_P2P_REQ_UNUSED) {
+  if (req->reqDone[idx].load(std::memory_order_acquire)) {
+    req->reqDone[idx].store(0, std::memory_order_relaxed);
     *done = 1;
     if (sizes)
       *sizes = 0;
@@ -675,82 +786,26 @@ static flagcxResult_t flagcxP2pTest(void *request, int *done, int *sizes) {
 
 static flagcxResult_t flagcxP2pTestBatch(void **requests, int nRequests,
                                          int *doneFlags, int *doneCount) {
-  if (nRequests == 0) {
-    *doneCount = 0;
-    return flagcxSuccess;
-  }
-
-  // Initialize all done flags to 0
+  int completed = 0;
   for (int i = 0; i < nRequests; i++) {
     doneFlags[i] = 0;
-  }
-
-  // Get CQ from first valid request (all requests share the same CQ)
-  struct ibv_cq *cq = nullptr;
-  struct flagcxP2pRequest *baseReqs = nullptr;
-  for (int i = 0; i < nRequests; i++) {
     struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)requests[i];
-    if (req != nullptr && req->type != FLAGCX_P2P_REQ_UNUSED) {
-      cq = req->cq;
-      baseReqs = req->reqs;
-      break;
+    if (req == NULL || req->type == FLAGCX_P2P_REQ_UNUSED) {
+      doneFlags[i] = 1;
+      completed++;
+      continue;
+    }
+
+    uint32_t idx = (uint32_t)(req - req->reqs);
+    if (idx >= FLAGCX_P2P_MAX_REQUESTS)
+      continue;
+
+    if (req->reqDone[idx].load(std::memory_order_acquire)) {
+      req->reqDone[idx].store(0, std::memory_order_relaxed);
+      doneFlags[i] = 1;
+      completed++;
     }
   }
-
-  if (cq == nullptr) {
-    // All requests are NULL or already done
-    int completed = 0;
-    for (int i = 0; i < nRequests; i++) {
-      struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)requests[i];
-      if (req == nullptr || req->type == FLAGCX_P2P_REQ_UNUSED) {
-        doneFlags[i] = 1;
-        completed++;
-      }
-    }
-    *doneCount = completed;
-    return flagcxSuccess;
-  }
-
-  // Batch poll the CQ
-  struct ibv_wc wcs[FLAGCX_P2P_BATCH_POLL_SIZE];
-  int nCqe = 0;
-  FLAGCXCHECK(flagcxWrapIbvPollCq(cq, FLAGCX_P2P_BATCH_POLL_SIZE, wcs, &nCqe));
-
-  int completed = 0;
-
-  // Process all returned completions
-  for (int w = 0; w < nCqe; w++) {
-    struct ibv_wc *wc = &wcs[w];
-
-    if (wc->status != IBV_WC_SUCCESS) {
-      WARN("NET/IB_P2P : CQ error: status=%d opcode=%d wr_id=%lu", wc->status,
-           wc->opcode, wc->wr_id);
-      return flagcxRemoteError;
-    }
-
-    // Map CQE back to request via wr_id
-    uint32_t reqIdx = wc->wr_id;
-    if (reqIdx >= FLAGCX_P2P_MAX_REQUESTS) {
-      WARN("NET/IB_P2P : invalid wr_id %u in CQE", reqIdx);
-      return flagcxInternalError;
-    }
-    struct flagcxP2pRequest *completedReq = &baseReqs[reqIdx];
-
-    completedReq->events--;
-    if (completedReq->events == 0) {
-      completedReq->type = FLAGCX_P2P_REQ_UNUSED;
-
-      // Check if this completion matches any of our requested requests
-      for (int i = 0; i < nRequests; i++) {
-        if (requests[i] == completedReq) {
-          doneFlags[i] = 1;
-          completed++;
-          break;
-        }
-      }
-    }
-  }
-
   *doneCount = completed;
   return flagcxSuccess;
 }
@@ -793,6 +848,8 @@ static void flagcxP2pDrainCq(struct ibv_cq *cq) {
 static flagcxResult_t flagcxP2pCloseSend(void *sendComm) {
   struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
   if (comm) {
+    if (comm->base.cq)
+      cqPollerUnregister(comm->base.cq);
     flagcxP2pDrainCq(comm->base.cq);
     if (comm->qp.qp)
       FLAGCXCHECK(flagcxWrapIbvDestroyQp(comm->qp.qp));
@@ -810,6 +867,8 @@ static flagcxResult_t flagcxP2pCloseSend(void *sendComm) {
 static flagcxResult_t flagcxP2pCloseRecv(void *recvComm) {
   struct flagcxP2pRecvComm *comm = (struct flagcxP2pRecvComm *)recvComm;
   if (comm) {
+    if (comm->base.cq)
+      cqPollerUnregister(comm->base.cq);
     flagcxP2pDrainCq(comm->base.cq);
     if (comm->qp.qp)
       FLAGCXCHECK(flagcxWrapIbvDestroyQp(comm->qp.qp));
