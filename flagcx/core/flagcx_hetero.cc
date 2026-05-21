@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #ifndef FLAGCX_RMA_QUEUE_SIZE
-#define FLAGCX_RMA_QUEUE_SIZE 256
+#define FLAGCX_RMA_QUEUE_SIZE 1024
 #endif
 #ifndef FLAGCX_RMA_BATCH_MAX
 #define FLAGCX_RMA_BATCH_MAX 256
@@ -267,7 +267,7 @@ static bool flagcxRmaProxyPollNonPersistDesc(struct flagcxRmaProxyState *proxy,
         descs[batchCount] = cur;
       }
 
-      if (batchCount > 1) {
+      if (batchCount >= 1) {
         void *requests[FLAGCX_RMA_BATCH_MAX_LIMIT];
         int posted = 0;
         flagcxResult_t res = flagcxRmaProxyPostPutBatch(

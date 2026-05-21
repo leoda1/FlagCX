@@ -107,15 +107,21 @@ flagcxIbCommonTestDataQp(struct flagcxIbRequest *r, int *done, int *sizes,
       return flagcxSuccess;
     }
 
+    // Poll up to kPollBatch CQEs per ibv_poll_cq call. Match the rest of
+    // the IB adaptor sites (and Mooncake's worker_pool) at 64; batch size
+    // 4 burns ~16x more syscalls under high CQE rate. Stack footprint is
+    // 64 * sizeof(ibv_wc) ~= 3 KB.
+    const int kPollBatch = 64;
     int totalWrDone = 0;
-    struct ibv_wc wcs[4];
+    struct ibv_wc wcs[kPollBatch];
     static __thread int poll_spin_count = 0;
 
     for (int i = 0; i < FLAGCX_IB_MAX_DEVS_PER_NIC; i++) {
       TIME_START(3);
       if (r->events[i]) {
         int wrDone = 0;
-        FLAGCXCHECK(flagcxWrapIbvPollCq(r->devBases[i]->cq, 4, wcs, &wrDone));
+        FLAGCXCHECK(
+            flagcxWrapIbvPollCq(r->devBases[i]->cq, kPollBatch, wcs, &wrDone));
         totalWrDone += wrDone;
         if (wrDone == 0) {
           TIME_CANCEL(3);

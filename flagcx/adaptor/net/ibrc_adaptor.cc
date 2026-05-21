@@ -19,8 +19,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -603,6 +605,28 @@ fail:
 }
 
 const char *reqTypeStr[] = {"Unused", "Send", "Recv", "Flush", "IPut", "IGet"};
+
+static const size_t flagcxIbIputBatchSliceSize = 64 * 1024;
+static const int flagcxIbIputBatchWrListMax = 256;
+static const uint64_t flagcxIbIputBatchWrCtxMagic = 0x4643495055575243ULL;
+
+struct flagcxIbIputBatchWrCtx {
+  uint64_t magic;
+  struct flagcxIbRequest *req;
+  int devIndex;
+};
+
+static uint64_t
+flagcxIbIputBatchMakeWrId(struct flagcxIbIputBatchWrCtx *ctx) {
+  return (uint64_t)(uintptr_t)ctx;
+}
+
+static struct flagcxIbIputBatchWrCtx *
+flagcxIbIputBatchWrCtxFromWrId(uint64_t wrId) {
+  if (wrId <= MAX_REQUESTS || (wrId & (sizeof(void *) - 1)) != 0)
+    return NULL;
+  return (struct flagcxIbIputBatchWrCtx *)(uintptr_t)wrId;
+}
 
 static void flagcxIbAddEvent(struct flagcxIbRequest *req, int devIndex,
                              struct flagcxIbNetCommDevBase *base) {
@@ -2144,6 +2168,36 @@ static flagcxResult_t flagcxIbrcProcessWc(struct flagcxIbRequest *r,
 
   *handled = false;
 
+  struct flagcxIbIputBatchWrCtx *ctx = NULL;
+  if (r->base->isSend &&
+      (r->type == FLAGCX_NET_IB_REQ_IPUT ||
+       r->type == FLAGCX_NET_IB_REQ_IGET)) {
+    ctx = flagcxIbIputBatchWrCtxFromWrId(wc->wr_id);
+  }
+  if (ctx != NULL) {
+    if (ctx->magic != flagcxIbIputBatchWrCtxMagic || ctx->req == NULL ||
+        ctx->devIndex < 0 || ctx->devIndex >= FLAGCX_IB_MAX_DEVS_PER_NIC) {
+      WARN("NET/IBRC: invalid IPut batch WR context wr_id=%lu",
+           (unsigned long)wc->wr_id);
+      return flagcxInternalError;
+    }
+    if (ctx->devIndex != devIndex) {
+      WARN("NET/IBRC: IPut batch completion on dev %d, expected dev %d",
+           devIndex, ctx->devIndex);
+      return flagcxInternalError;
+    }
+    if (ctx->req->events[devIndex] <= 0) {
+      WARN("NET/IBRC: IPut batch req(%p)->events={%d,%d}, dev=%d <= 0",
+           ctx->req, ctx->req->events[0], ctx->req->events[1], devIndex);
+      return flagcxInternalError;
+    }
+    ctx->req->events[devIndex]--;
+    ctx->magic = 0;
+    free(ctx);
+    *handled = true;
+    return flagcxSuccess;
+  }
+
   if (r->type == FLAGCX_NET_IB_REQ_RECV && !r->base->isSend) {
     struct flagcxIbRecvComm *rComm = (struct flagcxIbRecvComm *)r->base;
 
@@ -2476,6 +2530,70 @@ flagcxResult_t flagcxIbIput(void *sendComm, uint64_t srcOff, uint64_t dstOff,
   return flagcxSuccess;
 }
 
+struct flagcxIbIputBatchQpBucket {
+  struct ibv_send_wr wrs[flagcxIbIputBatchWrListMax];
+  struct ibv_sge sges[flagcxIbIputBatchWrListMax];
+  struct flagcxIbIputBatchWrCtx *ctxs[flagcxIbIputBatchWrListMax];
+  int reqIdxs[flagcxIbIputBatchWrListMax];
+  int count;
+};
+
+// Flush one QP bucket: chain its WRs, post once, attribute completions
+// (or failures) per-req. Resets bucket->count to 0 on return.
+static flagcxResult_t flagcxIbIputBatchFlushBucket(
+    struct flagcxIbSendComm *comm, struct flagcxIbIputBatchQpBucket *bucket,
+    int qpIdx, struct flagcxIbRequest **reqs, int *postedSlices) {
+  if (bucket->count == 0)
+    return flagcxSuccess;
+  struct flagcxIbQp *qp = &comm->base.qps[qpIdx];
+  int devIndex = qp->devIndex;
+
+  for (int i = 0; i < bucket->count; i++) {
+    bucket->wrs[i].next =
+        (i + 1 == bucket->count) ? NULL : &bucket->wrs[i + 1];
+  }
+
+  struct ibv_send_wr *bad_wr = NULL;
+  flagcxResult_t res = flagcxWrapIbvPostSend(qp->qp, bucket->wrs, &bad_wr);
+  int postedWrCount = bucket->count;
+  if (res != flagcxSuccess) {
+    postedWrCount = bad_wr ? (int)(bad_wr - bucket->wrs) : 0;
+    if (postedWrCount < 0 || postedWrCount > bucket->count)
+      postedWrCount = 0;
+  }
+
+  for (int i = 0; i < postedWrCount; i++) {
+    int reqIdx = bucket->reqIdxs[i];
+    flagcxIbAddEvent(reqs[reqIdx], devIndex, &comm->devs[devIndex].base);
+    postedSlices[reqIdx]++;
+  }
+
+  // Free ctxs of unposted WRs so they don't leak (no CQE will arrive).
+  for (int i = postedWrCount; i < bucket->count; i++) {
+    if (bucket->ctxs[i] != NULL) {
+      bucket->ctxs[i]->magic = 0;
+      free(bucket->ctxs[i]);
+      bucket->ctxs[i] = NULL;
+    }
+  }
+
+  bucket->count = 0;
+  return res;
+}
+
+static flagcxResult_t
+flagcxIbIputBatchDrainPartialRequest(struct flagcxIbRequest *req) {
+  int done = 0;
+  while (!done) {
+    flagcxResult_t res = flagcxIbTest(req, &done, NULL);
+    if (res != flagcxSuccess)
+      return res;
+    if (!done)
+      sched_yield();
+  }
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxIbIputBatch(void *sendComm, int count,
                                  const uint64_t *srcOffs,
                                  const uint64_t *dstOffs, const size_t *sizes,
@@ -2499,24 +2617,44 @@ flagcxResult_t flagcxIbIputBatch(void *sendComm, int count,
       dstOffs == NULL || sizes == NULL) {
     return flagcxInvalidArgument;
   }
+  if (comm->base.nqps <= 0)
+    return flagcxInternalError;
 
-  int qpIdx = comm->base.qpIndex;
-  comm->base.qpIndex = (qpIdx + 1) % comm->base.nqps;
-  struct flagcxIbQp *qp = &comm->base.qps[qpIdx];
-  int devIndex = qp->devIndex;
-  int lkey = srcInfo->lkeys[srcRank];
-  int rkey = dstInfo->rkeys[dstRank];
-
-  struct ibv_send_wr wrs[MAX_REQUESTS];
-  struct ibv_sge sges[MAX_REQUESTS];
+  // Declare-without-initializer up front so forward goto's past these
+  // declarations are well-formed in C++.
+  uint32_t lkey;
+  uint32_t rkey;
   struct flagcxIbRequest *reqs[MAX_REQUESTS];
-  memset(wrs, 0, count * sizeof(struct ibv_send_wr));
-  memset(sges, 0, count * sizeof(struct ibv_sge));
-  memset(reqs, 0, count * sizeof(struct flagcxIbRequest *));
+  int totalSlices[MAX_REQUESTS];
+  int postedSlices[MAX_REQUESTS];
+  flagcxResult_t res;
+  int nqps;
+  struct flagcxIbIputBatchQpBucket *buckets;
+  int postedRequests;
+  int firstFailedReqIdx;
 
-  flagcxResult_t res = flagcxSuccess;
-  struct ibv_send_wr *bad_wr = NULL;
+  lkey = srcInfo->lkeys[srcRank];
+  rkey = dstInfo->rkeys[dstRank];
+  memset(reqs, 0, count * sizeof(struct flagcxIbRequest *));
+  memset(totalSlices, 0, count * sizeof(int));
+  memset(postedSlices, 0, count * sizeof(int));
+  for (int i = 0; i < count; i++)
+    requests[i] = NULL;
+  res = flagcxSuccess;
+  buckets = NULL;
+  postedRequests = 0;
+  firstFailedReqIdx = -1;
   for (int i = 0; i < count; i++) {
+    size_t slicesForReq =
+        sizes[i] == 0 ? 1 : 1 + (sizes[i] - 1) / flagcxIbIputBatchSliceSize;
+    if (slicesForReq > (size_t)INT_MAX) {
+      WARN("flagcxIbIputBatch: transfer size %zu creates too many 64K WRs",
+           sizes[i]);
+      res = flagcxInvalidArgument;
+      goto fail_before_post;
+    }
+    totalSlices[i] = (int)slicesForReq;
+
     struct flagcxIbRequest *req = NULL;
     res = flagcxIbGetRequest(&comm->base, &req);
     if (res != flagcxSuccess) {
@@ -2528,55 +2666,171 @@ flagcxResult_t flagcxIbIputBatch(void *sendComm, int count,
     for (int d = 0; d < comm->base.ndevs; d++) {
       req->devBases[d] = &comm->devs[d].base;
     }
-
-    void *srcPtr = (void *)(srcInfo->baseVas[srcRank] + srcOffs[i]);
-    void *dstPtr = (void *)(dstInfo->baseVas[dstRank] + dstOffs[i]);
-
-    wrs[i].opcode = IBV_WR_RDMA_WRITE;
-    wrs[i].send_flags = IBV_SEND_SIGNALED;
-    wrs[i].wr_id = req - comm->base.reqs;
-    wrs[i].next = (i + 1 == count) ? NULL : &wrs[i + 1];
-    wrs[i].wr.rdma.remote_addr = (uint64_t)dstPtr;
-    wrs[i].wr.rdma.rkey = rkey;
-    wrs[i].sg_list = &sges[i];
-    wrs[i].num_sge = 1;
-
-    sges[i].addr = (uintptr_t)srcPtr;
-    sges[i].length = (uint32_t)sizes[i];
-    if ((size_t)sges[i].length != sizes[i]) {
-      WARN("flagcxIbIputBatch: transfer size %zu exceeds ibv_sge 32-bit limit",
-           sizes[i]);
-      res = flagcxInvalidArgument;
-      goto fail_before_post;
-    }
-    sges[i].lkey = lkey;
   }
 
-  res = flagcxWrapIbvPostSend(qp->qp, wrs, &bad_wr);
-  if (res != flagcxSuccess) {
-    int first_failed = bad_wr ? (int)(bad_wr - wrs) : 0;
-    if (first_failed < 0 || first_failed > count)
-      first_failed = 0;
-    for (int i = first_failed; i < count; i++) {
-      if (reqs[i] != NULL) {
-        flagcxIbFreeRequest(reqs[i]);
-        reqs[i] = NULL;
-      }
-    }
-    for (int i = 0; i < first_failed; i++) {
-      flagcxIbAddEvent(reqs[i], devIndex, &comm->devs[devIndex].base);
-      requests[i] = reqs[i];
-    }
-    *posted = first_failed;
-    return res;
+  nqps = comm->base.nqps;
+  buckets = (struct flagcxIbIputBatchQpBucket *)calloc(
+      (size_t)nqps, sizeof(struct flagcxIbIputBatchQpBucket));
+  if (buckets == NULL) {
+    WARN("flagcxIbIputBatch: unable to allocate per-QP bucket array");
+    res = flagcxSystemError;
+    goto fail_before_post;
   }
 
   for (int i = 0; i < count; i++) {
-    flagcxIbAddEvent(reqs[i], devIndex, &comm->devs[devIndex].base);
-    requests[i] = reqs[i];
+    size_t reqSize = sizes[i];
+    size_t offset = 0;
+    while (true) {
+      size_t len = 0;
+      if (reqSize != 0) {
+        size_t remaining = reqSize - offset;
+        len = remaining < flagcxIbIputBatchSliceSize
+                  ? remaining
+                  : flagcxIbIputBatchSliceSize;
+      }
+
+      // Pick QP for this slice: round-robin per chunk so each desc is
+      // sprayed across all QPs and every QP fills its own 256-bucket.
+      int qpBucket = comm->base.qpIndex;
+      comm->base.qpIndex = (qpBucket + 1) % nqps;
+      int devIndex = comm->base.qps[qpBucket].devIndex;
+
+      struct flagcxIbIputBatchWrCtx *ctx =
+          (struct flagcxIbIputBatchWrCtx *)malloc(sizeof(*ctx));
+      if (ctx == NULL) {
+        WARN("flagcxIbIputBatch: unable to allocate WR context");
+        res = flagcxSystemError;
+        goto fail_after_post;
+      }
+      ctx->magic = flagcxIbIputBatchWrCtxMagic;
+      ctx->req = reqs[i];
+      ctx->devIndex = devIndex;
+
+      struct flagcxIbIputBatchQpBucket *b = &buckets[qpBucket];
+      int slot = b->count;
+      memset(&b->wrs[slot], 0, sizeof(struct ibv_send_wr));
+      memset(&b->sges[slot], 0, sizeof(struct ibv_sge));
+
+      b->wrs[slot].opcode = IBV_WR_RDMA_WRITE;
+      b->wrs[slot].send_flags = IBV_SEND_SIGNALED;
+      b->wrs[slot].wr_id = flagcxIbIputBatchMakeWrId(ctx);
+      b->wrs[slot].wr.rdma.remote_addr =
+          dstInfo->baseVas[dstRank] + dstOffs[i] + offset;
+      b->wrs[slot].wr.rdma.rkey = rkey;
+      b->wrs[slot].sg_list = &b->sges[slot];
+      b->wrs[slot].num_sge = 1;
+
+      b->sges[slot].addr =
+          (uintptr_t)(srcInfo->baseVas[srcRank] + srcOffs[i] + offset);
+      b->sges[slot].length = (uint32_t)len;
+      b->sges[slot].lkey = lkey;
+
+      b->ctxs[slot] = ctx;
+      b->reqIdxs[slot] = i;
+      b->count++;
+
+      if (b->count == flagcxIbIputBatchWrListMax) {
+        res = flagcxIbIputBatchFlushBucket(comm, b, qpBucket, reqs,
+                                           postedSlices);
+        if (res != flagcxSuccess) {
+          if (firstFailedReqIdx < 0)
+            firstFailedReqIdx = i;
+          goto fail_after_post;
+        }
+      }
+
+      if (reqSize == 0)
+        break;
+      offset += len;
+      if (offset >= reqSize)
+        break;
+    }
   }
-  *posted = count;
+
+  // Tail flush: any non-empty bucket left.
+  for (int q = 0; q < nqps; q++) {
+    if (buckets[q].count > 0) {
+      res = flagcxIbIputBatchFlushBucket(comm, &buckets[q], q, reqs,
+                                         postedSlices);
+      if (res != flagcxSuccess) {
+        if (firstFailedReqIdx < 0) {
+          // Find lowest-indexed req whose chunks are not fully posted.
+          for (int i = 0; i < count; i++) {
+            if (postedSlices[i] != totalSlices[i]) {
+              firstFailedReqIdx = i;
+              break;
+            }
+          }
+          if (firstFailedReqIdx < 0)
+            firstFailedReqIdx = count;
+        }
+        goto fail_after_post;
+      }
+    }
+  }
+
+  // Success path: all chunks posted. Hand back every desc's req.
+  for (int i = 0; i < count; i++) {
+    if (postedSlices[i] != totalSlices[i]) {
+      WARN("flagcxIbIputBatch: desc %d posted=%d total=%d (internal mismatch)",
+           i, postedSlices[i], totalSlices[i]);
+      res = flagcxInternalError;
+      if (firstFailedReqIdx < 0)
+        firstFailedReqIdx = i;
+      goto fail_after_post;
+    }
+    requests[i] = reqs[i];
+    postedRequests++;
+  }
+  free(buckets);
+  *posted = postedRequests;
   return flagcxSuccess;
+
+fail_after_post:
+  // Drop any chunks still staged in any bucket (never went on wire).
+  for (int q = 0; q < nqps; q++) {
+    struct flagcxIbIputBatchQpBucket *b = &buckets[q];
+    for (int j = 0; j < b->count; j++) {
+      if (b->ctxs[j] != NULL) {
+        b->ctxs[j]->magic = 0;
+        free(b->ctxs[j]);
+        b->ctxs[j] = NULL;
+      }
+    }
+    b->count = 0;
+  }
+  // Hand back fully-posted descs in order, up to firstFailedReqIdx.
+  if (firstFailedReqIdx < 0)
+    firstFailedReqIdx = count;
+  for (int i = 0; i < firstFailedReqIdx; i++) {
+    if (postedSlices[i] != totalSlices[i]) {
+      // Earlier desc has unposted chunks; cap acceptance here.
+      firstFailedReqIdx = i;
+      break;
+    }
+    requests[i] = reqs[i];
+    postedRequests++;
+  }
+  for (int i = firstFailedReqIdx; i < count; i++) {
+    if (reqs[i] == NULL)
+      continue;
+    if (postedSlices[i] > 0) {
+      // Some chunks of this desc are already in flight; drain them so
+      // their CQEs don't land on a freed req.
+      flagcxResult_t drainRes = flagcxIbIputBatchDrainPartialRequest(reqs[i]);
+      if (drainRes != flagcxSuccess) {
+        WARN("flagcxIbIputBatch: failed to drain partial request %d res=%d", i,
+             (int)drainRes);
+        flagcxIbFreeRequest(reqs[i]);
+      }
+    } else {
+      flagcxIbFreeRequest(reqs[i]);
+    }
+    reqs[i] = NULL;
+  }
+  free(buckets);
+  *posted = postedRequests;
+  return res;
 
 fail_before_post:
   for (int i = 0; i < count; i++) {
