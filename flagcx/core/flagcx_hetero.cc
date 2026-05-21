@@ -22,8 +22,27 @@
 #endif
 #define FLAGCX_RMA_BATCH_MAX_LIMIT 256
 
+// Worker spins this many times yielding before condvar park. Tuned to a few
+// hundred microseconds of yields on a busy host — long enough that bursty
+// producers don't trigger a park/wake, short enough that genuinely idle
+// proxies stop burning CPU.
+#define FLAGCX_RMA_IDLE_SPIN 1000
+
 FLAGCX_PARAM(RmaQueueSize, "RMA_QUEUE_SIZE", FLAGCX_RMA_QUEUE_SIZE);
 FLAGCX_PARAM(RmaBatchMax, "RMA_BATCH_MAX", FLAGCX_RMA_BATCH_MAX);
+
+// Wake any parked worker so it picks up newly-enqueued descs.
+static inline void
+flagcxRmaProxyWakeWorkers(struct flagcxRmaProxyState *proxy) {
+  __atomic_fetch_add(&proxy->workerSubmitted, 1, __ATOMIC_RELEASE);
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    if (__atomic_load_n(&proxy->workerSuspended[w], __ATOMIC_ACQUIRE)) {
+      pthread_mutex_lock(&proxy->workerMu[w]);
+      pthread_cond_signal(&proxy->workerCv[w]);
+      pthread_mutex_unlock(&proxy->workerMu[w]);
+    }
+  }
+}
 
 // ---- Circular buffer helpers ----
 
@@ -61,9 +80,10 @@ flagcxRmaProxyEnqueueDesc(struct flagcxRmaProxyState *proxy, int peer,
   desc->request = NULL;
   desc->opSeq = __atomic_add_fetch(&proxy->opSeqs[peer], 1, __ATOMIC_RELAXED);
   proxy->circularBuffers[(size_t)peer * proxy->queueSize + idx] = desc;
-  // RELEASE so the progress thread sees desc contents before the pi bump.
+  // RELEASE so the workers see desc contents before the pi bump.
   __atomic_store_n(&proxy->pis[peer], pi + 1, __ATOMIC_RELEASE);
   pthread_mutex_unlock(&proxy->peerProducerMutexes[peer]);
+  flagcxRmaProxyWakeWorkers(proxy);
   return flagcxSuccess;
 }
 
@@ -99,6 +119,7 @@ flagcxRmaProxyEnqueueDescBatch(struct flagcxRmaProxyState *proxy, int peer,
     (*enqueued)++;
   }
   pthread_mutex_unlock(&proxy->peerProducerMutexes[peer]);
+  flagcxRmaProxyWakeWorkers(proxy);
   return flagcxSuccess;
 }
 
@@ -176,14 +197,26 @@ static flagcxResult_t flagcxRmaProxyPostPutBatch(struct flagcxHeteroComm *comm,
 
 // Poll and retire completed descs at the head of inProgressQueues[peer].
 // Returns after the head desc is not yet complete (enforces per-peer FIFO).
+//
+// Caller holds peerPollMutexes[peer] (so this is the only worker calling
+// netAdaptor->test on this peer's CQ). queueMutex is taken briefly around
+// each Empty/Head/Dequeue, since the post-side worker (under postMutex) may
+// be enqueuing concurrently.
 static bool
 flagcxRmaProxyPollNonPersistCompletion(struct flagcxRmaProxyState *proxy,
                                        int peer) {
   struct flagcxHeteroComm *comm = proxy->comm;
   bool did = false;
-  while (!flagcxIntruQueueEmpty(&proxy->inProgressQueues[peer])) {
+  while (true) {
+    pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
+    if (flagcxIntruQueueEmpty(&proxy->inProgressQueues[peer])) {
+      pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
+      break;
+    }
     struct flagcxRmaDesc *desc =
         flagcxIntruQueueHead(&proxy->inProgressQueues[peer]);
+    pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
+
     int done = 0;
     bool failed = false;
     if (desc->request != NULL) {
@@ -203,7 +236,11 @@ flagcxRmaProxyPollNonPersistCompletion(struct flagcxRmaProxyState *proxy,
     }
     if (!done)
       break;
+
+    pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
     flagcxIntruQueueDequeue(&proxy->inProgressQueues[peer]);
+    pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
+
     __atomic_fetch_sub(&proxy->inFlights[peer], 1, __ATOMIC_RELAXED);
     if (!failed) {
       // Publish completion: doneSeqs with RELEASE so waiters acquire-see it.
@@ -283,11 +320,13 @@ static bool flagcxRmaProxyPollNonPersistDesc(struct flagcxRmaProxyState *proxy,
           break;
         }
 
+        pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
         for (int i = 0; i < posted; i++) {
           descs[i]->request = requests[i];
           descs[i]->next = NULL;
           flagcxIntruQueueEnqueue(&proxy->inProgressQueues[peer], descs[i]);
         }
+        pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
         __atomic_store_n(&proxy->cis[peer], ci + (uint32_t)posted,
                          __ATOMIC_RELEASE);
         __atomic_fetch_add(&proxy->inFlights[peer], (uint32_t)posted,
@@ -312,9 +351,12 @@ static bool flagcxRmaProxyPollNonPersistDesc(struct flagcxRmaProxyState *proxy,
     }
     // RELEASE so the producer sees the slot freed.
     __atomic_store_n(&proxy->cis[peer], ci + 1, __ATOMIC_RELEASE);
-    // Enqueue to inProgressQueues[peer] (progress-thread private).
+    // Enqueue to inProgressQueues[peer]. queueMutex protects against the
+    // poll-side worker peeking/popping the head concurrently.
     desc->next = NULL;
+    pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
     flagcxIntruQueueEnqueue(&proxy->inProgressQueues[peer], desc);
+    pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
     __atomic_fetch_add(&proxy->inFlights[peer], 1, __ATOMIC_RELAXED);
     did = true;
   }
@@ -336,62 +378,152 @@ static void flagcxRmaProxyDrainRing(struct flagcxRmaProxyState *proxy,
   }
 }
 
-// One pass over all peers: poll completions and issue pending descs.
-// Returns true if any progress was made.
-static bool flagcxRmaProxyProgress(struct flagcxRmaProxyState *proxy,
-                                   bool stopping, bool *anyOutstanding) {
+struct flagcxRmaWorkerCtx {
+  struct flagcxRmaProxyState *proxy;
+  int workerId;
+};
+
+// Try to drive the post side for one peer. Returns true if work was done,
+// false if the lock was contended or there was nothing to do. Bumps
+// *anyOutstanding when ring is non-empty so the worker doesn't park.
+static bool flagcxRmaProxyTryPost(struct flagcxRmaProxyState *proxy, int peer,
+                                  void *sendComm, bool stopping,
+                                  bool *anyOutstanding) {
+  if (pthread_mutex_trylock(&proxy->peerPostMutexes[peer]) != 0) {
+    if (!flagcxRmaProxyCircularBufEmpty(proxy, peer))
+      *anyOutstanding = true;
+    return false;
+  }
+  bool did = false;
+  if (sendComm != NULL) {
+    if (flagcxRmaProxyPollNonPersistDesc(proxy, peer, sendComm))
+      did = true;
+  } else if (!flagcxRmaProxyCircularBufEmpty(proxy, peer)) {
+    if (stopping) {
+      WARN("flagcxRmaProxy: stop with queued descs but no sendComm peer=%d; "
+           "draining",
+           peer);
+      __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
+      flagcxRmaProxyDrainRing(proxy, peer);
+      did = true;
+    } else {
+      WARN("flagcxRmaProxy: no sendComm for peer %d", peer);
+      __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
+    }
+  }
+  if (!flagcxRmaProxyCircularBufEmpty(proxy, peer))
+    *anyOutstanding = true;
+  pthread_mutex_unlock(&proxy->peerPostMutexes[peer]);
+  return did;
+}
+
+// Try to drive the poll side for one peer. Returns true if work was done.
+static bool flagcxRmaProxyTryPoll(struct flagcxRmaProxyState *proxy, int peer,
+                                  bool *anyOutstanding) {
+  if (pthread_mutex_trylock(&proxy->peerPollMutexes[peer]) != 0) {
+    // Another worker is polling — that worker will set anyOutstanding if
+    // there's still work. Mark anyOutstanding from the queue length we can
+    // observe (cheap read of head pointer under queueMutex).
+    pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
+    if (!flagcxIntruQueueEmpty(&proxy->inProgressQueues[peer]))
+      *anyOutstanding = true;
+    pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
+    return false;
+  }
+  bool did = flagcxRmaProxyPollNonPersistCompletion(proxy, peer);
+  pthread_mutex_lock(&proxy->peerQueueMutexes[peer]);
+  if (!flagcxIntruQueueEmpty(&proxy->inProgressQueues[peer]))
+    *anyOutstanding = true;
+  pthread_mutex_unlock(&proxy->peerQueueMutexes[peer]);
+  pthread_mutex_unlock(&proxy->peerPollMutexes[peer]);
+  return did;
+}
+
+// One pass over all peers from this worker's perspective. Worker 0 prefers
+// the post side, worker 1 prefers the poll side — when both workers contend
+// on the same peer's locks (PD-disaggregated single-peer case) this naturally
+// splits roles so post and poll run concurrently.
+static bool flagcxRmaProxyProgressOnce(struct flagcxRmaProxyState *proxy,
+                                       int workerId, bool stopping,
+                                       bool *anyOutstanding) {
   bool did = false;
   *anyOutstanding = false;
-  // Read the cached fullSendComms once per pass (published exactly once
-  // from the registration path; NULL until then). See
-  // flagcxHeteroRmaProxyPublishSendComms() for why this is safe.
   void *const *fullSendComms =
       __atomic_load_n(&proxy->fullSendComms, __ATOMIC_ACQUIRE);
   for (int p = 0; p < proxy->nRanks; p++) {
-    if (flagcxRmaProxyPollNonPersistCompletion(proxy, p))
-      did = true;
-
     void *sendComm = (fullSendComms != NULL) ? fullSendComms[p] : NULL;
-    if (sendComm != NULL) {
-      if (flagcxRmaProxyPollNonPersistDesc(proxy, p, sendComm))
+    if (workerId == 0) {
+      if (flagcxRmaProxyTryPost(proxy, p, sendComm, stopping, anyOutstanding))
         did = true;
-    } else if (!flagcxRmaProxyCircularBufEmpty(proxy, p)) {
-      if (stopping) {
-        // Shutdown with queued-but-unissued descs and no transport.
-        // Drain to let the thread exit; flag the error so waiters fail.
-        WARN("flagcxRmaProxyProgress: stop with queued descs but no "
-             "sendComm peer=%d; draining",
-             p);
-        __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
-        flagcxRmaProxyDrainRing(proxy, p);
+      if (flagcxRmaProxyTryPoll(proxy, p, anyOutstanding))
         did = true;
-      } else {
-        // Pre-registration: caller enqueued an op before the full mesh
-        // is ready. Surface as an error rather than spin forever.
-        WARN("flagcxRmaProxyProgress: no sendComm for peer %d", p);
-        __atomic_store_n(&proxy->rmaError, 1, __ATOMIC_RELEASE);
-      }
+    } else {
+      if (flagcxRmaProxyTryPoll(proxy, p, anyOutstanding))
+        did = true;
+      if (flagcxRmaProxyTryPost(proxy, p, sendComm, stopping, anyOutstanding))
+        did = true;
     }
-
-    if (!flagcxRmaProxyCircularBufEmpty(proxy, p) ||
-        !flagcxIntruQueueEmpty(&proxy->inProgressQueues[p]))
-      *anyOutstanding = true;
   }
   return did;
 }
 
-static void *flagcxRmaProxyProgressThread(void *arg) {
-  struct flagcxRmaProxyState *proxy = (struct flagcxRmaProxyState *)arg;
+static void *flagcxRmaProxyWorkerThread(void *arg) {
+  struct flagcxRmaWorkerCtx *ctx = (struct flagcxRmaWorkerCtx *)arg;
+  struct flagcxRmaProxyState *proxy = ctx->proxy;
+  int workerId = ctx->workerId;
+  free(ctx);
+
   bool stopping = false;
+  int idleSpin = 0;
   while (true) {
     if (__atomic_load_n(&proxy->stop, __ATOMIC_ACQUIRE))
       stopping = true;
     bool anyOutstanding = false;
-    bool did = flagcxRmaProxyProgress(proxy, stopping, &anyOutstanding);
+    bool did = flagcxRmaProxyProgressOnce(proxy, workerId, stopping,
+                                          &anyOutstanding);
+    __atomic_fetch_add(&proxy->workerProcessed[workerId], 1, __ATOMIC_RELAXED);
     if (stopping && !anyOutstanding && !did)
       break;
-    if (!did)
+    if (did) {
+      idleSpin = 0;
+      continue;
+    }
+    if (anyOutstanding) {
+      // Other worker is making progress or work is in-flight on a CQ
+      // we couldn't lock. Yield, don't park.
       sched_yield();
+      idleSpin = 0;
+      continue;
+    }
+    if (++idleSpin < FLAGCX_RMA_IDLE_SPIN) {
+      sched_yield();
+      continue;
+    }
+    // Genuinely idle — park on condvar until producer signals or stop is set.
+    pthread_mutex_lock(&proxy->workerMu[workerId]);
+    bool stillIdle = !__atomic_load_n(&proxy->stop, __ATOMIC_ACQUIRE);
+    if (stillIdle) {
+      // Re-check work under the worker mutex to avoid lost wakeups: the
+      // producer-side wake path takes this same mutex before signalling.
+      void *const *recheck =
+          __atomic_load_n(&proxy->fullSendComms, __ATOMIC_ACQUIRE);
+      for (int p = 0; p < proxy->nRanks && stillIdle; p++) {
+        if (!flagcxRmaProxyCircularBufEmpty(proxy, p)) {
+          stillIdle = false;
+          break;
+        }
+        // We don't peek inProgressQueues here: anyOutstanding above already
+        // covered that case via the !did/!anyOutstanding gate.
+        (void)recheck;
+      }
+    }
+    if (stillIdle) {
+      __atomic_store_n(&proxy->workerSuspended[workerId], 1, __ATOMIC_RELEASE);
+      pthread_cond_wait(&proxy->workerCv[workerId], &proxy->workerMu[workerId]);
+      __atomic_store_n(&proxy->workerSuspended[workerId], 0, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&proxy->workerMu[workerId]);
+    idleSpin = 0;
   }
   return NULL;
 }
@@ -429,20 +561,31 @@ flagcxResult_t flagcxHeteroRmaProxyStart(flagcxHeteroComm_t comm) {
           sizeof(flagcxIntruQueue<struct flagcxRmaDesc, &flagcxRmaDesc::next>));
   proxy->peerProducerMutexes =
       (pthread_mutex_t *)calloc(nRanks, sizeof(pthread_mutex_t));
+  proxy->peerPostMutexes =
+      (pthread_mutex_t *)calloc(nRanks, sizeof(pthread_mutex_t));
+  proxy->peerPollMutexes =
+      (pthread_mutex_t *)calloc(nRanks, sizeof(pthread_mutex_t));
+  proxy->peerQueueMutexes =
+      (pthread_mutex_t *)calloc(nRanks, sizeof(pthread_mutex_t));
   proxy->opSeqs = (volatile uint64_t *)calloc(nRanks, sizeof(uint64_t));
   proxy->doneSeqs = (volatile uint64_t *)calloc(nRanks, sizeof(uint64_t));
   proxy->inFlights = (volatile uint32_t *)calloc(nRanks, sizeof(uint32_t));
 
   if (proxy->circularBuffers == NULL || proxy->pis == NULL ||
       proxy->cis == NULL || proxy->inProgressQueues == NULL ||
-      proxy->peerProducerMutexes == NULL || proxy->opSeqs == NULL ||
-      proxy->doneSeqs == NULL || proxy->inFlights == NULL) {
+      proxy->peerProducerMutexes == NULL || proxy->peerPostMutexes == NULL ||
+      proxy->peerPollMutexes == NULL || proxy->peerQueueMutexes == NULL ||
+      proxy->opSeqs == NULL || proxy->doneSeqs == NULL ||
+      proxy->inFlights == NULL) {
     WARN("flagcxHeteroRmaProxyStart: failed to allocate ring buffers");
     free(proxy->circularBuffers);
     free((void *)proxy->pis);
     free((void *)proxy->cis);
     free(proxy->inProgressQueues);
     free(proxy->peerProducerMutexes);
+    free(proxy->peerPostMutexes);
+    free(proxy->peerPollMutexes);
+    free(proxy->peerQueueMutexes);
     free((void *)proxy->opSeqs);
     free((void *)proxy->doneSeqs);
     free((void *)proxy->inFlights);
@@ -452,33 +595,79 @@ flagcxResult_t flagcxHeteroRmaProxyStart(flagcxHeteroComm_t comm) {
 
   for (int p = 0; p < nRanks; p++) {
     pthread_mutex_init(&proxy->peerProducerMutexes[p], NULL);
+    pthread_mutex_init(&proxy->peerPostMutexes[p], NULL);
+    pthread_mutex_init(&proxy->peerPollMutexes[p], NULL);
+    pthread_mutex_init(&proxy->peerQueueMutexes[p], NULL);
     flagcxIntruQueueConstruct(&proxy->inProgressQueues[p]);
   }
 
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    pthread_mutex_init(&proxy->workerMu[w], NULL);
+    pthread_cond_init(&proxy->workerCv[w], NULL);
+    proxy->workerSuspended[w] = 0;
+    proxy->workerProcessed[w] = 0;
+  }
+  proxy->workerSubmitted = 0;
   proxy->stop = 0;
   comm->rmaProxy = proxy;
 
-  if (pthread_create(&proxy->thread, NULL, flagcxRmaProxyProgressThread,
-                     proxy) != 0) {
-    WARN("flagcxHeteroRmaProxyStart: pthread_create failed");
-    for (int p = 0; p < nRanks; p++)
-      pthread_mutex_destroy(&proxy->peerProducerMutexes[p]);
-    free(proxy->circularBuffers);
-    free((void *)proxy->pis);
-    free((void *)proxy->cis);
-    free(proxy->inProgressQueues);
-    free(proxy->peerProducerMutexes);
-    free((void *)proxy->opSeqs);
-    free((void *)proxy->doneSeqs);
-    free((void *)proxy->inFlights);
-    free(proxy);
-    comm->rmaProxy = NULL;
-    return flagcxSystemError;
+  int spawned = 0;
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    struct flagcxRmaWorkerCtx *wctx = (struct flagcxRmaWorkerCtx *)calloc(
+        1, sizeof(struct flagcxRmaWorkerCtx));
+    if (wctx == NULL) {
+      WARN("flagcxHeteroRmaProxyStart: failed to allocate worker ctx");
+      goto spawn_fail;
+    }
+    wctx->proxy = proxy;
+    wctx->workerId = w;
+    if (pthread_create(&proxy->workerThreads[w], NULL,
+                       flagcxRmaProxyWorkerThread, wctx) != 0) {
+      WARN("flagcxHeteroRmaProxyStart: pthread_create failed for worker %d", w);
+      free(wctx);
+      goto spawn_fail;
+    }
+    spawned++;
   }
 
-  INFO(FLAGCX_INIT, "RMA progress thread started (nRanks=%d queueSize=%u)",
-       nRanks, qs);
+  INFO(FLAGCX_INIT,
+       "RMA progress threads started (nRanks=%d queueSize=%u workers=%d)",
+       nRanks, qs, FLAGCX_RMA_WORKERS);
   return flagcxSuccess;
+
+spawn_fail:
+  __atomic_store_n(&proxy->stop, 1, __ATOMIC_RELEASE);
+  for (int w = 0; w < spawned; w++) {
+    pthread_mutex_lock(&proxy->workerMu[w]);
+    pthread_cond_broadcast(&proxy->workerCv[w]);
+    pthread_mutex_unlock(&proxy->workerMu[w]);
+  }
+  for (int w = 0; w < spawned; w++)
+    pthread_join(proxy->workerThreads[w], NULL);
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    pthread_mutex_destroy(&proxy->workerMu[w]);
+    pthread_cond_destroy(&proxy->workerCv[w]);
+  }
+  for (int p = 0; p < nRanks; p++) {
+    pthread_mutex_destroy(&proxy->peerProducerMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerPostMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerPollMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerQueueMutexes[p]);
+  }
+  free(proxy->circularBuffers);
+  free((void *)proxy->pis);
+  free((void *)proxy->cis);
+  free(proxy->inProgressQueues);
+  free(proxy->peerProducerMutexes);
+  free(proxy->peerPostMutexes);
+  free(proxy->peerPollMutexes);
+  free(proxy->peerQueueMutexes);
+  free((void *)proxy->opSeqs);
+  free((void *)proxy->doneSeqs);
+  free((void *)proxy->inFlights);
+  free(proxy);
+  comm->rmaProxy = NULL;
+  return flagcxSystemError;
 }
 
 flagcxResult_t flagcxHeteroRmaProxyStop(flagcxHeteroComm_t comm) {
@@ -487,15 +676,32 @@ flagcxResult_t flagcxHeteroRmaProxyStop(flagcxHeteroComm_t comm) {
     return flagcxSuccess;
 
   __atomic_store_n(&proxy->stop, 1, __ATOMIC_RELEASE);
-  pthread_join(proxy->thread, NULL);
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    pthread_mutex_lock(&proxy->workerMu[w]);
+    pthread_cond_broadcast(&proxy->workerCv[w]);
+    pthread_mutex_unlock(&proxy->workerMu[w]);
+  }
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++)
+    pthread_join(proxy->workerThreads[w], NULL);
 
-  for (int p = 0; p < proxy->nRanks; p++)
+  for (int w = 0; w < FLAGCX_RMA_WORKERS; w++) {
+    pthread_mutex_destroy(&proxy->workerMu[w]);
+    pthread_cond_destroy(&proxy->workerCv[w]);
+  }
+  for (int p = 0; p < proxy->nRanks; p++) {
     pthread_mutex_destroy(&proxy->peerProducerMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerPostMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerPollMutexes[p]);
+    pthread_mutex_destroy(&proxy->peerQueueMutexes[p]);
+  }
   free(proxy->circularBuffers);
   free((void *)proxy->pis);
   free((void *)proxy->cis);
   free(proxy->inProgressQueues);
   free(proxy->peerProducerMutexes);
+  free(proxy->peerPostMutexes);
+  free(proxy->peerPollMutexes);
+  free(proxy->peerQueueMutexes);
   free((void *)proxy->opSeqs);
   free((void *)proxy->doneSeqs);
   free((void *)proxy->inFlights);

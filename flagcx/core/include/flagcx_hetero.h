@@ -33,9 +33,16 @@ struct flagcxRmaDesc {
   struct flagcxRmaDesc *next; // intrusive link for inProgressQueues
 };
 
+// Number of proxy worker threads. Hardcoded to 2: one biased toward post
+// duty, one biased toward poll duty. With per-peer postMutex/pollMutex
+// trylock-based dispatch this gives concurrent post+poll even when only one
+// peer is active (PD-disaggregated case).
+#define FLAGCX_RMA_WORKERS 2
+
 // Per-comm async RMA proxy state.
-// pending queues: producer = caller (proxy kernel thread), consumer = progress
-// thread. inProgress queues: progress thread only (no locking needed).
+// pending queues: producer = caller, consumer = worker that holds postMutex.
+// inProgress queues: tail enqueue under postMutex+queueMutex by post-side
+// worker; head dequeue under pollMutex+queueMutex by poll-side worker.
 struct flagcxRmaProxyState {
   uint32_t queueSize;                     // power of two
   uint32_t queueMask;                     // queueSize - 1
@@ -43,7 +50,15 @@ struct flagcxRmaProxyState {
   volatile uint32_t *pis;                 // [nRanks] producer index
   volatile uint32_t *cis;                 // [nRanks] consumer index
 
-  pthread_mutex_t *peerProducerMutexes; // [nRanks]
+  pthread_mutex_t *peerProducerMutexes; // [nRanks] (caller side)
+  // Worker-side per-peer locks. postMutex serializes the ring->post path
+  // (touches cis, qpIndex inside iput, and inProgressQueues tail). pollMutex
+  // serializes ibv_poll_cq + retire of inProgressQueues head. queueMutex is
+  // held briefly during inProgressQueues enqueue/dequeue to make tail/head
+  // updates safe across the post and poll workers.
+  pthread_mutex_t *peerPostMutexes;  // [nRanks]
+  pthread_mutex_t *peerPollMutexes;  // [nRanks]
+  pthread_mutex_t *peerQueueMutexes; // [nRanks]
   struct flagcxIntruQueue<struct flagcxRmaDesc, &flagcxRmaDesc::next>
       *inProgressQueues;        // [nRanks]
   volatile uint64_t *opSeqs;    // [nRanks]
@@ -54,15 +69,24 @@ struct flagcxRmaProxyState {
   // Callers record the value before issuing ops, then poll until it advances.
   volatile uint64_t completionCount;
 
-  // Set to 1 by the progress thread when an IB op fails (test error, post
-  // error, or missing sendComm). Wait functions check this and return an error.
+  // Set to 1 by a worker when an IB op fails (test error, post error, or
+  // missing sendComm). Wait functions check this and return an error.
   volatile int rmaError;
 
   void *const *fullSendComms; // [nRanks] or NULL until published
   int nRanks;
   struct flagcxHeteroComm *comm; // back-pointer
 
-  pthread_t thread;
+  // 2-worker pool. Each worker tries trylock on per-peer postMutex and
+  // pollMutex; preference order is set by workerId so worker 0 grabs post
+  // first and worker 1 grabs poll first, naturally splitting roles when both
+  // are contended on the same peer.
+  pthread_t workerThreads[FLAGCX_RMA_WORKERS];
+  pthread_mutex_t workerMu[FLAGCX_RMA_WORKERS];
+  pthread_cond_t workerCv[FLAGCX_RMA_WORKERS];
+  volatile int workerSuspended[FLAGCX_RMA_WORKERS];
+  volatile uint64_t workerSubmitted;
+  volatile uint64_t workerProcessed[FLAGCX_RMA_WORKERS];
   volatile int stop;
 };
 
