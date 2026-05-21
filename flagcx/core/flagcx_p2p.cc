@@ -56,10 +56,17 @@ struct FlagcxP2pListenHandleView {
 static_assert(sizeof(FlagcxP2pListenHandleView) <= FLAGCX_NET_HANDLE_MAXSIZE,
               "listen handle must fit in FLAGCX_NET_HANDLE_MAXSIZE");
 
+static constexpr int kP2pQpsPerConn = 4;
+
+struct FlagcxP2pChannelView {
+  struct ibv_cq *cq;
+  struct flagcxIbQp qp;
+};
+
 struct FlagcxP2pCommView {
   int ibDevN;
   struct flagcxIbNetCommDevBase base;
-  struct flagcxIbQp qp;
+  struct FlagcxP2pChannelView channels[kP2pQpsPerConn];
   struct flagcxSocket sock;
 };
 
@@ -187,7 +194,7 @@ static uint64_t gNextXferId = 1;
 /*  Async Transfer Worker Infrastructure                               */
 /* ------------------------------------------------------------------ */
 
-static constexpr int kWindowSize = 64;
+static constexpr int kWindowSize = 8;
 
 enum AsyncXferOp { ASYNC_XFER_READ, ASYNC_XFER_WRITE };
 
@@ -1550,7 +1557,6 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
 
   std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
   {
-    auto t0 = std::chrono::high_resolution_clock::now();
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
       FlagcxP2pMemRegEntry *entry = findMemRegByMr(mrIds[i]);
@@ -1573,11 +1579,6 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
 
       localEntries[i] = *entry;
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    fprintf(stderr,
-            "[FlagCX P2P] ReadVector memReg lookup: numIovs=%d, time=%.4f ms\n",
-            numIovs, ms);
   }
 
   ensureAsyncWorkerStarted();
@@ -1606,10 +1607,6 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
   pthread_cond_signal(&gAsyncWorker.cv);
 
   *transferId = xferId;
-  fprintf(
-      stderr,
-      "[FlagCX P2P] ReadVector submitted async task: xferId=%lu, numIovs=%d\n",
-      (unsigned long)xferId, numIovs);
   return 0;
 }
 
