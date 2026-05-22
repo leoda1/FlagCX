@@ -71,12 +71,22 @@ struct flagcxP2pConnMeta {
 };
 
 // P2P request — simplified from flagcxIbRequest
-#define FLAGCX_P2P_MAX_REQUESTS 128
+#define FLAGCX_P2P_MAX_REQUESTS 256
 #define FLAGCX_P2P_REQ_UNUSED 0
 #define FLAGCX_P2P_REQ_IPUT 1
 #define FLAGCX_P2P_REQ_IGET 2
 #define FLAGCX_P2P_BATCH_POLL_SIZE 32
 #define FLAGCX_P2P_QPS_PER_CONN 4
+#define FLAGCX_P2P_IGET_BATCH_MAX_WR 64
+#define FLAGCX_P2P_READ_BATCH_WINDOW 8
+
+// flagcxIbCreateQp configures each P2P QP with 2 * MAX_REQUESTS send WRs.
+// The read engine round-robins an 8-batch window across four QPs, so one QP
+// can hold at most two fixed-size READ batches.
+static_assert(2 * FLAGCX_P2P_IGET_BATCH_MAX_WR <= 2 * MAX_REQUESTS,
+              "P2P READ batch window exceeds QP send queue capacity");
+static_assert(FLAGCX_P2P_READ_BATCH_WINDOW / FLAGCX_P2P_QPS_PER_CONN == 2,
+              "P2P READ batch capacity assumes two batches per QP");
 
 struct flagcxP2pRequest {
   int type;
@@ -834,6 +844,73 @@ static flagcxResult_t flagcxP2pIget(void *sendComm, uint64_t srcOff,
 }
 
 static flagcxResult_t
+flagcxP2pIgetBatch(void *sendComm, int count, const uint64_t *srcOffs,
+                   const uint64_t *dstOffs, const size_t *sizes, int srcRank,
+                   int dstRank, void *const *srcHandles,
+                   void *const *dstHandles, void **request) {
+  struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
+  if (count <= 0 || count > FLAGCX_P2P_IGET_BATCH_MAX_WR || srcOffs == NULL ||
+      dstOffs == NULL || sizes == NULL || srcHandles == NULL ||
+      dstHandles == NULL || request == NULL) {
+    WARN("NET/IB_P2P : invalid igetBatch arguments, count %d", count);
+    return flagcxInternalError;
+  }
+
+  struct flagcxP2pRequest *req;
+  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, NULL,
+                                  FLAGCX_P2P_REQ_IGET, &req));
+  struct flagcxP2pChannel *channel =
+      flagcxP2pNextChannel(comm->channels, &comm->nextChannel);
+  req->cq = channel->cq;
+
+  struct ibv_send_wr wrs[FLAGCX_P2P_IGET_BATCH_MAX_WR];
+  struct ibv_sge sges[FLAGCX_P2P_IGET_BATCH_MAX_WR];
+  memset(wrs, 0, sizeof(wrs));
+  memset(sges, 0, sizeof(sges));
+
+  for (int i = 0; i < count; i++) {
+    if (srcHandles[i] == NULL || dstHandles[i] == NULL) {
+      WARN("NET/IB_P2P : igetBatch handle %d is NULL", i);
+      flagcxP2pFreeRequest(req);
+      return flagcxInternalError;
+    }
+
+    struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles[i];
+    struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles[i];
+
+    sges[i].addr = dst->baseVa + dstOffs[i];
+    sges[i].length = (uint32_t)sizes[i];
+    if ((size_t)sges[i].length != sizes[i]) {
+      WARN("NET/IB_P2P : igetBatch size %zu exceeds 32-bit limit", sizes[i]);
+      flagcxP2pFreeRequest(req);
+      return flagcxInternalError;
+    }
+    sges[i].lkey = dst->lkey;
+
+    wrs[i].opcode = IBV_WR_RDMA_READ;
+    wrs[i].send_flags =
+        i == count - 1 ? IBV_SEND_SIGNALED : 0; // final CQE tracks batch
+    wrs[i].wr_id = i == count - 1 ? req - comm->reqs : 0;
+    wrs[i].wr.rdma.remote_addr = src->baseVa + srcOffs[i];
+    wrs[i].wr.rdma.rkey = src->rkey;
+    wrs[i].sg_list = &sges[i];
+    wrs[i].num_sge = 1;
+    wrs[i].next = i + 1 < count ? &wrs[i + 1] : NULL;
+  }
+
+  req->events = 1;
+  struct ibv_send_wr *bad_wr;
+  flagcxResult_t res = flagcxWrapIbvPostSend(channel->qp.qp, &wrs[0], &bad_wr);
+  if (res != flagcxSuccess) {
+    flagcxP2pFreeRequest(req);
+    return res;
+  }
+
+  *request = req;
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
 flagcxP2pIputSignal(void *sendComm, uint64_t srcOff, uint64_t dstOff,
                     size_t size, int srcRank, int dstRank, void **srcHandles,
                     void **dstHandles, uint64_t signalOff, void **signalHandles,
@@ -1110,4 +1187,5 @@ struct flagcxNetAdaptor flagcxNetIbP2p = {
     // Optional batch operations
     nullptr,            // iputBatch
     flagcxP2pTestBatch, // testBatch
+    flagcxP2pIgetBatch, // igetBatch
 };

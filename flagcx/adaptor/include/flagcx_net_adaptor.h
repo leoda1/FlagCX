@@ -25,6 +25,7 @@ typedef enum {
 //         regMr, regMrDmaBuf, deregMr, isend, irecv, iflush, test,
 //         iput, iget, iputSignal, getDevFromName
 //   v2 — adds iputBatch (optional one-sided batch WRITE)
+//   latest — adds optional batch helpers for one-sided transfers
 
 struct flagcxNetAdaptor_v1 {
   // Basic functions
@@ -139,6 +140,13 @@ struct flagcxNetAdaptor_latest {
   // If NULL, caller falls back to per-request test().
   flagcxResult_t (*testBatch)(void **requests, int nRequests, int *doneFlags,
                               int *doneCount);
+  // Optional one-side batch READ. Success returns one logical request for the
+  // full batch.
+  flagcxResult_t (*igetBatch)(void *sendComm, int count,
+                              const uint64_t *srcOffs, const uint64_t *dstOffs,
+                              const size_t *sizes, int srcRank, int dstRank,
+                              void *const *srcHandles, void *const *dstHandles,
+                              void **request);
 };
 
 #define flagcxNetAdaptor flagcxNetAdaptor_latest
