@@ -195,6 +195,7 @@ static uint64_t gNextXferId = 1;
 /* ------------------------------------------------------------------ */
 
 static constexpr int kWindowSize = 8;
+static constexpr int kIgetBatchSize = 64;
 
 enum AsyncXferOp { ASYNC_XFER_READ, ASYNC_XFER_WRITE };
 
@@ -224,6 +225,123 @@ static FlagcxP2pCommView *getCommView(void *comm) {
   return reinterpret_cast<FlagcxP2pCommView *>(comm);
 }
 
+struct AsyncReadBatchEntry {
+  void *request = nullptr;
+  int firstIov = 0;
+  int count = 0;
+};
+
+static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
+                             struct flagcxNetAdaptor *adaptor, int connIbDevN) {
+  AsyncReadBatchEntry inflight[kWindowSize];
+  int issuedIovs = 0;
+  int completedIovs = 0;
+  int issuedBatches = 0;
+  int completedBatches = 0;
+
+  while (completedIovs < task->numIovs) {
+    while (issuedIovs < task->numIovs &&
+           issuedBatches - completedBatches < kWindowSize) {
+      const int count = std::min(kIgetBatchSize, task->numIovs - issuedIovs);
+      uint64_t srcOffs[kIgetBatchSize] = {};
+      uint64_t dstOffs[kIgetBatchSize] = {};
+      FlagcxP2pMrHandleView remoteMrs[kIgetBatchSize] = {};
+      void *srcHandles[kIgetBatchSize] = {};
+      void *dstHandles[kIgetBatchSize] = {};
+
+      for (int batchIov = 0; batchIov < count; batchIov++) {
+        const int iov = issuedIovs + batchIov;
+        if (task->localEntries[iov].ibDevN != connIbDevN)
+          return false;
+
+        FlagcxP2pMrHandleView *localMr =
+            reinterpret_cast<FlagcxP2pMrHandleView *>(
+                task->localEntries[iov].mhandle);
+        dstOffs[batchIov] = (uintptr_t)task->dataVec[iov] - localMr->baseVa;
+        remoteMrs[batchIov].baseVa = task->descs[iov].addr;
+        remoteMrs[batchIov].rkey = task->descs[iov].rkey;
+        srcHandles[batchIov] = &remoteMrs[batchIov];
+        dstHandles[batchIov] = task->localEntries[iov].mhandle;
+      }
+
+      void *request = nullptr;
+      flagcxResult_t rc =
+          adaptor->igetBatch(task->conn->sendComm, count, srcOffs, dstOffs,
+                             task->sizeVec.data() + issuedIovs, 0, 0,
+                             srcHandles, dstHandles, &request);
+      if (rc != flagcxSuccess)
+        return false;
+
+      AsyncReadBatchEntry &entry = inflight[issuedBatches % kWindowSize];
+      entry.request = request;
+      entry.firstIov = issuedIovs;
+      entry.count = count;
+      issuedIovs += count;
+      issuedBatches++;
+    }
+
+    int newlyCompleted = 0;
+    if (adaptor->testBatch != nullptr) {
+      void *batchRequests[kWindowSize];
+      int batchIndices[kWindowSize];
+      int batchCount = 0;
+      for (int batch = completedBatches; batch < issuedBatches; batch++) {
+        AsyncReadBatchEntry &entry = inflight[batch % kWindowSize];
+        if (entry.request != nullptr) {
+          batchRequests[batchCount] = entry.request;
+          batchIndices[batchCount] = batch;
+          batchCount++;
+        }
+      }
+
+      if (batchCount > 0) {
+        int doneFlags[kWindowSize];
+        int doneCount = 0;
+        flagcxResult_t rc = adaptor->testBatch(batchRequests, batchCount,
+                                               doneFlags, &doneCount);
+        if (rc != flagcxSuccess)
+          return false;
+
+        for (int i = 0; i < batchCount; i++) {
+          if (doneFlags[i]) {
+            inflight[batchIndices[i] % kWindowSize].request = nullptr;
+            newlyCompleted++;
+          }
+        }
+      }
+    } else {
+      for (int batch = completedBatches; batch < issuedBatches; batch++) {
+        AsyncReadBatchEntry &entry = inflight[batch % kWindowSize];
+        if (entry.request == nullptr)
+          continue;
+
+        int done = 0;
+        int sizes = 0;
+        flagcxResult_t rc = adaptor->test(entry.request, &done, &sizes);
+        if (rc != flagcxSuccess)
+          return false;
+        if (done) {
+          entry.request = nullptr;
+          newlyCompleted++;
+        }
+      }
+    }
+
+    while (completedBatches < issuedBatches) {
+      AsyncReadBatchEntry &entry = inflight[completedBatches % kWindowSize];
+      if (entry.request != nullptr)
+        break;
+      completedIovs += entry.count;
+      completedBatches++;
+    }
+
+    if (newlyCompleted == 0 && issuedIovs >= task->numIovs)
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
+  }
+
+  return true;
+}
+
 static void asyncWorkerFunc() {
   while (true) {
     std::shared_ptr<AsyncTransferTask> task;
@@ -243,6 +361,13 @@ static void asyncWorkerFunc() {
     struct flagcxNetAdaptor *adaptor = conn->engine->adaptor;
     const int numIovs = task->numIovs;
     const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+
+    if (task->op == ASYNC_XFER_READ && adaptor->igetBatch != nullptr) {
+      bool ok = asyncReadBatched(task, adaptor, connIbDevN);
+      task->result.store(ok ? 0 : -1, std::memory_order_release);
+      task->done.store(true, std::memory_order_release);
+      continue;
+    }
 
     std::vector<void *> inflightReqs(kWindowSize, nullptr);
     int issued = 0, completed = 0;
