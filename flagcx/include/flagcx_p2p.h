@@ -13,9 +13,11 @@
 #ifndef FLAGCX_P2P_H_
 #define FLAGCX_P2P_H_
 
+#include <atomic>
 #include <cstring>
 #include <stddef.h>
 #include <stdint.h>
+#include <string>
 #include <vector>
 
 /* ------------------------------------------------------------------ */
@@ -25,6 +27,14 @@
 #define FLAGCX_P2P_MSG_SIZE 256
 #define FLAGCX_P2P_DESC_SIZE 64
 #define FLAGCX_P2P_IPC_INFO_SIZE 128
+
+/* Compile-time upper bound on QPs per engine. The comm struct carries a
+   fixed-size qp_list_ array (mirrored between core and adaptor), so we
+   need *some* compile-time bound; the actually-used count comes from
+   FlagcxP2pGlobalConfig::qpsPerConn (env: FLAGCX_P2P_QPS_PER_CONN). All
+   other tunables (per-post WR count, batch poll size, ...) live in the
+   runtime config and have no shadow #define. */
+constexpr int kFlagcxP2pMaxQpsPerEngine = 8;
 
 /* ------------------------------------------------------------------ */
 /*  Opaque handle types                                               */
@@ -85,6 +95,105 @@ inline void flagcxP2pDeserializeRdmaDesc(const char *buf,
   std::memcpy(&desc->rid, buf + 20, sizeof(uint32_t));
   std::memcpy(&desc->idx, buf + 24, sizeof(uint64_t));
   std::memcpy(desc->padding, buf + 32, sizeof(desc->padding));
+}
+
+struct FlagcxSlice;
+
+struct FlagcxTransferTask {
+  std::atomic<uint64_t> sliceCount{0};
+  std::atomic<uint64_t> doneSliceCount{0};
+  std::vector<FlagcxSlice *> sliceList;
+
+  bool isAllDone() const {
+    auto total = sliceCount.load(std::memory_order_acquire);
+    auto done = doneSliceCount.load(std::memory_order_acquire);
+    return total > 0 && done >= total;
+  }
+};
+
+/* Verbs-free slice opcode encoding. The adaptor maps these to ibv_wr_opcode
+ * at post time so flagcx_p2p.h stays free of <infiniband/verbs.h>. */
+enum FlagcxSliceOp : uint8_t {
+  FLAGCX_SLICE_OP_WRITE = 0,
+  FLAGCX_SLICE_OP_READ = 1,
+};
+
+struct FlagcxSlice {
+  uint64_t srcVa;        /* WRITE: local src VA;  READ: local dst VA          */
+  uint64_t dstVa;        /* WRITE: remote dst VA; READ: remote src VA         */
+  uint32_t length;       /* Single-WR byte count                              */
+  uint32_t lkey;         /* Local MR lkey                                     */
+  uint32_t rkey;         /* Remote MR rkey                                    */
+  uint8_t opcode;        /* FLAGCX_SLICE_OP_*                                 */
+
+  /* Routing key — Step 2 will hash this to a shard / endpoint cache key.
+     Step 1 leaves it empty for the NIXL path (no further sharding). */
+  std::string peerNicPath;
+
+  /* Back-pointer used by the CQ poller to bump the owning task's
+     doneSliceCount when this slice's CQE arrives. */
+  FlagcxTransferTask *task;
+
+  volatile int *qpDepth;
+
+  inline void markSuccess() {
+    if (task)
+      task->doneSliceCount.fetch_add(1, std::memory_order_release);
+  }
+  inline void markFailed() {
+    if (task)
+      task->doneSliceCount.fetch_add(1, std::memory_order_release);
+  }
+};
+
+/* ----- Slice cut policies ----- */
+
+/* NIXL path: 1 desc = 1 slice. NIXL has already chunked at block granularity
+   so further cutting is unnecessary. */
+struct FlagcxNixlSlicePolicy {
+  static constexpr bool kFurtherCut = false;
+  static constexpr size_t kBlockSize = SIZE_MAX;
+  static constexpr size_t kFragmentSize = 0;
+};
+
+/* Connector path: cut into 64K WRs, but merge the trailing fragment if it is
+   ≤ kBlockSize + kFragmentSize so we avoid a tiny tail WR. */
+struct FlagcxConnectorSlicePolicy {
+  static constexpr bool kFurtherCut = true;
+  static constexpr size_t kBlockSize = 64 * 1024;
+  static constexpr size_t kFragmentSize = 4 * 1024;
+};
+
+/* Build slices for one (srcVa, dstVa, totalLen) triple and append them to
+   task->sliceList; bumps task->sliceCount. Caller owns task and is
+   responsible for freeing slices once task->isAllDone(). */
+template <typename Policy>
+inline void flagcxBuildSlices(FlagcxTransferTask *task, uint64_t srcVa,
+                              uint64_t dstVa, size_t totalLen, uint32_t lkey,
+                              uint32_t rkey, uint8_t opcode,
+                              const std::string &peerNicPath) {
+  if (!Policy::kFurtherCut) {
+    auto *s = new FlagcxSlice{srcVa,        dstVa, (uint32_t)totalLen,
+                              lkey,         rkey,  opcode,
+                              peerNicPath,  task,  nullptr};
+    task->sliceList.push_back(s);
+    task->sliceCount.fetch_add(1, std::memory_order_release);
+    return;
+  }
+  size_t off = 0;
+  while (off < totalLen) {
+    bool merge =
+        (totalLen - off) <= Policy::kBlockSize + Policy::kFragmentSize;
+    size_t len = merge ? (totalLen - off) : Policy::kBlockSize;
+    auto *s = new FlagcxSlice{srcVa + off,  dstVa + off, (uint32_t)len,
+                              lkey,         rkey,        opcode,
+                              peerNicPath,  task,        nullptr};
+    task->sliceList.push_back(s);
+    task->sliceCount.fetch_add(1, std::memory_order_release);
+    off += len;
+    if (merge)
+      break;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -423,5 +532,58 @@ int flagcxP2pEngineGetIpcInfo(FlagcxP2pEngine *engine, uintptr_t addr,
  */
 int flagcxP2pEngineUpdateIpcInfo(char *ipcBuf, uintptr_t addr,
                                  uintptr_t baseAddr, size_t size);
+
+/* ================================================================== */
+/*  Global runtime configuration                                      */
+/* ================================================================== */
+
+struct FlagcxP2pGlobalConfig {
+  /* Worker pool / QP topology */
+  int qpsPerConn = 4;        /* FLAGCX_P2P_QPS_PER_CONN          */
+  int workersPerPool = 2;    /* FLAGCX_P2P_WORKERS_PER_POOL      */
+  int shardCount = 8;        /* FLAGCX_P2P_SHARD_COUNT           */
+
+  /* CQ / WR / completion-queue depth */
+  size_t sharedCqDepth = 4096;  /* FLAGCX_P2P_CQ_DEPTH           */
+  size_t maxWrPerPost = 256;    /* FLAGCX_P2P_MAX_WR_PER_POST    */
+  size_t maxRequests = 256;     /* FLAGCX_P2P_MAX_REQUESTS       */
+  size_t batchPollSize = 32;    /* FLAGCX_P2P_BATCH_POLL_SIZE    */
+  size_t readBatchWindow = 8;   /* FLAGCX_P2P_READ_BATCH_WINDOW  */
+
+  /* Slice cut policy */
+  size_t sliceSize = 64 * 1024;     /* FLAGCX_P2P_SLICE_SIZE      */
+  size_t fragmentLimit = 4 * 1024;  /* FLAGCX_P2P_FRAGMENT_LIMIT  */
+
+  /* IB QP attributes — verbs-clean (plain int) so this header does
+     not pull <infiniband/verbs.h>. */
+  size_t maxSge = 4;            /* FLAGCX_P2P_MAX_SGE             */
+  size_t maxInline = 64;        /* FLAGCX_P2P_MAX_INLINE          */
+  uint8_t ibPort = 1;           /* FLAGCX_P2P_IB_PORT             */
+  int gidIndex = -1;            /* FLAGCX_P2P_GID_INDEX (-1=auto) */
+  int mtuLength = 4096;         /* FLAGCX_P2P_MTU                 */
+  int ibTrafficClass = -1;      /* FLAGCX_P2P_IB_TC (-1=off)      */
+  int retryCnt = 7;             /* FLAGCX_P2P_RETRY_CNT           */
+
+  /* Notification */
+  int notifMaxPeers = 64;       /* FLAGCX_P2P_NOTIF_MAX_PEERS     */
+
+  /* Misc */
+  bool enableDestDeviceAffinity = false; /* FLAGCX_P2P_DEST_DEV_AFFINITY */
+};
+
+/* Returns the lazy-loaded singleton (mooncake::globalConfig() shape).
+   First call materializes the struct and parses env vars exactly once. */
+const FlagcxP2pGlobalConfig &flagcxP2pGlobalConfig();
+
+/* Logs the resolved config once. Implicitly invoked at first
+   flagcxP2pGlobalConfig() call. */
+void flagcxP2pDumpGlobalConfig();
+
+/* Clamp size-limited fields against ibv_query_device() results — call
+   once from the adaptor's init path after IB attributes are known. The
+   four uint32 inputs are the obvious ibv_device_attr counterparts; we
+   take plain ints to keep verbs out of this header. */
+void flagcxP2pClampToDeviceLimits(uint32_t maxQpWr, uint32_t maxSge,
+                                  uint32_t maxCqe, uint32_t maxQp);
 
 #endif /* FLAGCX_P2P_H_ */
