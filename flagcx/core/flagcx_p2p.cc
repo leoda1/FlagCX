@@ -197,25 +197,129 @@ static uint64_t gNextXferId = 1;
 static constexpr int kWindowSize = 8;
 static constexpr int kIgetBatchSize = 64;
 
-enum AsyncXferOp { ASYNC_XFER_READ, ASYNC_XFER_WRITE };
-
-struct AsyncTransferTask {
-  FlagcxP2pConn *conn;
-  AsyncXferOp op;
-  int numIovs;
-  std::vector<void *> dataVec;
-  std::vector<size_t> sizeVec;
-  std::vector<FlagcxP2pRdmaDesc> descs;
-  std::vector<FlagcxP2pMemRegEntry> localEntries;
-  std::atomic<bool> done{false};
-  std::atomic<int> result{0};
+enum FlagcxSlicePolicyKind {
+  FLAGCX_POLICY_NIXL = 0,
+  FLAGCX_POLICY_FLAGCX = 1,
 };
+
+struct FlagcxTransferTask;
+
+struct FlagcxSlice {
+  // WRITE: local source VA; READ: local destination VA.
+  uint64_t srcVa = 0;
+  // WRITE: remote destination VA; READ: remote source VA.
+  uint64_t dstVa = 0;
+  uint32_t length = 0;
+  uint32_t lkey = 0;
+  uint32_t rkey = 0;
+  uint8_t opcode = 0;
+  FlagcxTransferTask *task = nullptr;
+
+  void markSuccess();
+  void markFailed();
+};
+
+struct FlagcxTransferTask {
+  FlagcxP2pConn *conn = nullptr;
+  std::atomic<uint64_t> sliceCount{0};
+  std::atomic<uint64_t> doneSliceCount{0};
+  std::atomic<int> result{0};
+  std::vector<FlagcxSlice *> sliceList;
+
+  bool isAllDone() const {
+    const uint64_t total = sliceCount.load(std::memory_order_acquire);
+    const uint64_t done = doneSliceCount.load(std::memory_order_acquire);
+    return total > 0 && done >= total;
+  }
+};
+
+void FlagcxSlice::markSuccess() {
+  if (task)
+    task->doneSliceCount.fetch_add(1, std::memory_order_release);
+}
+
+void FlagcxSlice::markFailed() {
+  if (task) {
+    task->result.store(-1, std::memory_order_release);
+    task->doneSliceCount.fetch_add(1, std::memory_order_release);
+  }
+}
+
+struct NixlSlicePolicy {
+  static constexpr bool kFurtherCut = false;
+  static constexpr size_t kBlockSize = SIZE_MAX;
+  static constexpr size_t kFragmentSize = 0;
+};
+
+struct FlagcxSlicePolicy {
+  static constexpr bool kFurtherCut = true;
+  static constexpr size_t kBlockSize = 64 * 1024;
+  static constexpr size_t kFragmentSize = 4 * 1024;
+};
+
+template <typename Policy>
+static int buildSlices(FlagcxTransferTask *task, uint64_t srcVa, uint64_t dstVa,
+                       size_t totalLen, uint32_t lkey, uint32_t rkey,
+                       uint8_t opcode) {
+  if (task == nullptr || totalLen == 0)
+    return -1;
+
+  if constexpr (!Policy::kFurtherCut) {
+    if (totalLen > UINT32_MAX)
+      return -1;
+    FlagcxSlice *slice = new FlagcxSlice;
+    slice->srcVa = srcVa;
+    slice->dstVa = dstVa;
+    slice->length = static_cast<uint32_t>(totalLen);
+    slice->lkey = lkey;
+    slice->rkey = rkey;
+    slice->opcode = opcode;
+    slice->task = task;
+    task->sliceList.push_back(slice);
+    task->sliceCount.fetch_add(1, std::memory_order_release);
+    return 0;
+  } else {
+    size_t off = 0;
+    while (off < totalLen) {
+      const size_t remaining = totalLen - off;
+      const bool mergeTail =
+          remaining <= Policy::kBlockSize + Policy::kFragmentSize;
+      const size_t len = mergeTail ? remaining : Policy::kBlockSize;
+      if (len > UINT32_MAX)
+        return -1;
+
+      FlagcxSlice *slice = new FlagcxSlice;
+      slice->srcVa = srcVa + off;
+      slice->dstVa = dstVa + off;
+      slice->length = static_cast<uint32_t>(len);
+      slice->lkey = lkey;
+      slice->rkey = rkey;
+      slice->opcode = opcode;
+      slice->task = task;
+      task->sliceList.push_back(slice);
+      task->sliceCount.fetch_add(1, std::memory_order_release);
+
+      off += len;
+      if (mergeTail)
+        break;
+    }
+    return 0;
+  }
+}
+
+static void cleanupTransferTask(FlagcxTransferTask *task) {
+  if (task == nullptr)
+    return;
+  for (FlagcxSlice *slice : task->sliceList)
+    delete slice;
+  delete task;
+}
 
 struct AsyncWorker {
   std::thread thread;
   pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
-  std::deque<std::shared_ptr<AsyncTransferTask>> queue;
+  std::deque<std::shared_ptr<FlagcxTransferTask>> queue;
   std::atomic<bool> stop{false};
 };
 
@@ -227,56 +331,78 @@ static FlagcxP2pCommView *getCommView(void *comm) {
 
 struct AsyncReadBatchEntry {
   void *request = nullptr;
-  int firstIov = 0;
+  int firstSlice = 0;
   int count = 0;
 };
 
-static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
-                             struct flagcxNetAdaptor *adaptor, int connIbDevN) {
+static inline bool isReadSlice(const FlagcxSlice *slice) {
+  return slice != nullptr && slice->opcode == IBV_WR_RDMA_READ;
+}
+
+static inline uint64_t sliceLocalVa(const FlagcxSlice *slice) {
+  return slice->srcVa;
+}
+
+static inline uint64_t sliceRemoteVa(const FlagcxSlice *slice) {
+  return slice->dstVa;
+}
+
+static void markSlicesFailed(std::shared_ptr<FlagcxTransferTask> task,
+                             int firstSlice) {
+  if (!task)
+    return;
+  for (size_t i = firstSlice; i < task->sliceList.size(); i++)
+    task->sliceList[i]->markFailed();
+}
+
+static bool asyncReadBatched(std::shared_ptr<FlagcxTransferTask> task,
+                             struct flagcxNetAdaptor *adaptor) {
   AsyncReadBatchEntry inflight[kWindowSize];
-  int issuedIovs = 0;
-  int completedIovs = 0;
+  const int numSlices = static_cast<int>(task->sliceList.size());
+  int issuedSlices = 0;
+  int completedSlices = 0;
   int issuedBatches = 0;
   int completedBatches = 0;
 
-  while (completedIovs < task->numIovs) {
-    while (issuedIovs < task->numIovs &&
+  while (completedSlices < numSlices) {
+    while (issuedSlices < numSlices &&
            issuedBatches - completedBatches < kWindowSize) {
-      const int count = std::min(kIgetBatchSize, task->numIovs - issuedIovs);
+      const int count = std::min(kIgetBatchSize, numSlices - issuedSlices);
       uint64_t srcOffs[kIgetBatchSize] = {};
       uint64_t dstOffs[kIgetBatchSize] = {};
+      size_t sizes[kIgetBatchSize] = {};
       FlagcxP2pMrHandleView remoteMrs[kIgetBatchSize] = {};
+      FlagcxP2pMrHandleView localMrs[kIgetBatchSize] = {};
       void *srcHandles[kIgetBatchSize] = {};
       void *dstHandles[kIgetBatchSize] = {};
 
-      for (int batchIov = 0; batchIov < count; batchIov++) {
-        const int iov = issuedIovs + batchIov;
-        if (task->localEntries[iov].ibDevN != connIbDevN)
+      for (int batchSlice = 0; batchSlice < count; batchSlice++) {
+        const int sliceIdx = issuedSlices + batchSlice;
+        FlagcxSlice *slice = task->sliceList[sliceIdx];
+        if (!isReadSlice(slice))
           return false;
 
-        FlagcxP2pMrHandleView *localMr =
-            reinterpret_cast<FlagcxP2pMrHandleView *>(
-                task->localEntries[iov].mhandle);
-        dstOffs[batchIov] = (uintptr_t)task->dataVec[iov] - localMr->baseVa;
-        remoteMrs[batchIov].baseVa = task->descs[iov].addr;
-        remoteMrs[batchIov].rkey = task->descs[iov].rkey;
-        srcHandles[batchIov] = &remoteMrs[batchIov];
-        dstHandles[batchIov] = task->localEntries[iov].mhandle;
+        remoteMrs[batchSlice].baseVa = sliceRemoteVa(slice);
+        remoteMrs[batchSlice].rkey = slice->rkey;
+        localMrs[batchSlice].baseVa = sliceLocalVa(slice);
+        localMrs[batchSlice].lkey = slice->lkey;
+        srcHandles[batchSlice] = &remoteMrs[batchSlice];
+        dstHandles[batchSlice] = &localMrs[batchSlice];
+        sizes[batchSlice] = slice->length;
       }
 
       void *request = nullptr;
       flagcxResult_t rc =
           adaptor->igetBatch(task->conn->sendComm, count, srcOffs, dstOffs,
-                             task->sizeVec.data() + issuedIovs, 0, 0,
-                             srcHandles, dstHandles, &request);
+                             sizes, 0, 0, srcHandles, dstHandles, &request);
       if (rc != flagcxSuccess)
         return false;
 
       AsyncReadBatchEntry &entry = inflight[issuedBatches % kWindowSize];
       entry.request = request;
-      entry.firstIov = issuedIovs;
+      entry.firstSlice = issuedSlices;
       entry.count = count;
-      issuedIovs += count;
+      issuedSlices += count;
       issuedBatches++;
     }
 
@@ -304,7 +430,11 @@ static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
 
         for (int i = 0; i < batchCount; i++) {
           if (doneFlags[i]) {
-            inflight[batchIndices[i] % kWindowSize].request = nullptr;
+            AsyncReadBatchEntry &entry =
+                inflight[batchIndices[i] % kWindowSize];
+            for (int s = 0; s < entry.count; s++)
+              task->sliceList[entry.firstSlice + s]->markSuccess();
+            entry.request = nullptr;
             newlyCompleted++;
           }
         }
@@ -321,6 +451,8 @@ static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
         if (rc != flagcxSuccess)
           return false;
         if (done) {
+          for (int s = 0; s < entry.count; s++)
+            task->sliceList[entry.firstSlice + s]->markSuccess();
           entry.request = nullptr;
           newlyCompleted++;
         }
@@ -331,11 +463,11 @@ static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
       AsyncReadBatchEntry &entry = inflight[completedBatches % kWindowSize];
       if (entry.request != nullptr)
         break;
-      completedIovs += entry.count;
+      completedSlices += entry.count;
       completedBatches++;
     }
 
-    if (newlyCompleted == 0 && issuedIovs >= task->numIovs)
+    if (newlyCompleted == 0 && issuedSlices >= numSlices)
       std::this_thread::sleep_for(std::chrono::microseconds(1));
   }
 
@@ -344,7 +476,7 @@ static bool asyncReadBatched(std::shared_ptr<AsyncTransferTask> task,
 
 static void asyncWorkerFunc() {
   while (true) {
-    std::shared_ptr<AsyncTransferTask> task;
+    std::shared_ptr<FlagcxTransferTask> task;
     pthread_mutex_lock(&gAsyncWorker.mutex);
     while (gAsyncWorker.queue.empty() && !gAsyncWorker.stop.load()) {
       pthread_cond_wait(&gAsyncWorker.cv, &gAsyncWorker.mutex);
@@ -359,13 +491,20 @@ static void asyncWorkerFunc() {
 
     FlagcxP2pConn *conn = task->conn;
     struct flagcxNetAdaptor *adaptor = conn->engine->adaptor;
-    const int numIovs = task->numIovs;
-    const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+    const int numSlices = static_cast<int>(task->sliceList.size());
 
-    if (task->op == ASYNC_XFER_READ && adaptor->igetBatch != nullptr) {
-      bool ok = asyncReadBatched(task, adaptor, connIbDevN);
+    if (numSlices == 0) {
+      task->result.store(-1, std::memory_order_release);
+      task->sliceCount.store(1, std::memory_order_release);
+      task->doneSliceCount.store(1, std::memory_order_release);
+      continue;
+    }
+
+    if (isReadSlice(task->sliceList[0]) && adaptor->igetBatch != nullptr) {
+      bool ok = asyncReadBatched(task, adaptor);
+      if (!ok)
+        markSlicesFailed(task, 0);
       task->result.store(ok ? 0 : -1, std::memory_order_release);
-      task->done.store(true, std::memory_order_release);
       continue;
     }
 
@@ -373,42 +512,35 @@ static void asyncWorkerFunc() {
     int issued = 0, completed = 0;
     bool error = false;
 
-    while (completed < numIovs && !error) {
+    while (completed < numSlices && !error) {
       // Post up to kWindowSize ahead of completed
-      while (issued < numIovs && (issued - completed) < kWindowSize) {
-        if (task->localEntries[issued].ibDevN != connIbDevN) {
-          error = true;
-          break;
-        }
-
-        FlagcxP2pMrHandleView *localMr =
-            reinterpret_cast<FlagcxP2pMrHandleView *>(
-                task->localEntries[issued].mhandle);
-
+      while (issued < numSlices && (issued - completed) < kWindowSize) {
+        FlagcxSlice *slice = task->sliceList[issued];
+        FlagcxP2pMrHandleView localMr;
         FlagcxP2pMrHandleView remoteMr;
+        memset(&localMr, 0, sizeof(localMr));
         memset(&remoteMr, 0, sizeof(remoteMr));
-        remoteMr.baseVa = task->descs[issued].addr;
-        remoteMr.rkey = task->descs[issued].rkey;
+
+        localMr.baseVa = sliceLocalVa(slice);
+        localMr.lkey = slice->lkey;
+        remoteMr.baseVa = sliceRemoteVa(slice);
+        remoteMr.rkey = slice->rkey;
 
         void *request = NULL;
         flagcxResult_t rc;
 
-        if (task->op == ASYNC_XFER_READ) {
+        if (isReadSlice(slice)) {
           const uint64_t srcOff = 0;
-          const uint64_t dstOff =
-              (uintptr_t)task->dataVec[issued] - localMr->baseVa;
-          rc = adaptor->iget(conn->sendComm, srcOff, dstOff,
-                             task->sizeVec[issued], 0, 0, (void **)&remoteMr,
-                             (void **)task->localEntries[issued].mhandle,
-                             &request);
-        } else {
-          const uint64_t srcOff =
-              (uintptr_t)task->dataVec[issued] - localMr->baseVa;
           const uint64_t dstOff = 0;
-          rc = adaptor->iput(conn->sendComm, srcOff, dstOff,
-                             task->sizeVec[issued], 0, 0,
-                             (void **)task->localEntries[issued].mhandle,
-                             (void **)&remoteMr, &request);
+          rc =
+              adaptor->iget(conn->sendComm, srcOff, dstOff, slice->length, 0, 0,
+                            (void **)&remoteMr, (void **)&localMr, &request);
+        } else {
+          const uint64_t srcOff = 0;
+          const uint64_t dstOff = 0;
+          rc =
+              adaptor->iput(conn->sendComm, srcOff, dstOff, slice->length, 0, 0,
+                            (void **)&localMr, (void **)&remoteMr, &request);
         }
 
         if (rc != flagcxSuccess) {
@@ -450,6 +582,7 @@ static void asyncWorkerFunc() {
               if (doneFlags[b]) {
                 int i = batchIndices[b];
                 int slot = i % kWindowSize;
+                task->sliceList[i]->markSuccess();
                 inflightReqs[slot] = nullptr;
                 newlyCompleted++;
               }
@@ -466,11 +599,13 @@ static void asyncWorkerFunc() {
           int done = 0, sizes = 0;
           flagcxResult_t res = adaptor->test(inflightReqs[slot], &done, &sizes);
           if (res != flagcxSuccess) {
+            task->sliceList[i]->markFailed();
             inflightReqs[slot] = nullptr;
             newlyCompleted++;
             continue;
           }
           if (done) {
+            task->sliceList[i]->markSuccess();
             inflightReqs[slot] = nullptr;
             newlyCompleted++;
           }
@@ -484,13 +619,15 @@ static void asyncWorkerFunc() {
       }
 
       // Yield briefly if no progress was made
-      if (newlyCompleted == 0 && issued >= numIovs) {
+      if (newlyCompleted == 0 && issued >= numSlices) {
         std::this_thread::sleep_for(std::chrono::microseconds(1));
       }
     }
 
-    task->result.store(error ? -1 : 0, std::memory_order_release);
-    task->done.store(true, std::memory_order_release);
+    if (error) {
+      markSlicesFailed(task, completed);
+      task->result.store(-1, std::memory_order_release);
+    }
   }
 }
 
@@ -518,7 +655,7 @@ static void stopAsyncWorker() {
 }
 
 // Map from transfer ID to async task (for XferStatus polling)
-static std::unordered_map<uint64_t, std::shared_ptr<AsyncTransferTask>>
+static std::unordered_map<uint64_t, std::shared_ptr<FlagcxTransferTask>>
     gAsyncXferMap;
 static std::mutex gAsyncXferMutex;
 
@@ -1680,7 +1817,12 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
     return -1;
   }
 
-  std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
+  std::shared_ptr<FlagcxTransferTask> task(new FlagcxTransferTask,
+                                           cleanupTransferTask);
+  task->conn = conn;
+  task->sliceList.reserve(numIovs);
+  const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+
   {
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
@@ -1702,20 +1844,22 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
         return -1;
       }
 
-      localEntries[i] = *entry;
+      if (entry->ibDevN != connIbDevN)
+        return -1;
+
+      FlagcxP2pMrHandleView *localMr =
+          reinterpret_cast<FlagcxP2pMrHandleView *>(entry->mhandle);
+      if (buildSlices<NixlSlicePolicy>(
+              task.get(),
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dstVec[i])),
+              descs[i].addr, sizeVec[i], localMr->lkey, descs[i].rkey,
+              IBV_WR_RDMA_READ) != 0) {
+        return -1;
+      }
     }
   }
 
   ensureAsyncWorkerStarted();
-
-  auto task = std::make_shared<AsyncTransferTask>();
-  task->conn = conn;
-  task->op = ASYNC_XFER_READ;
-  task->numIovs = numIovs;
-  task->dataVec = std::move(dstVec);
-  task->sizeVec = std::move(sizeVec);
-  task->descs = std::move(descs);
-  task->localEntries = std::move(localEntries);
 
   const uint64_t xferId = [&] {
     std::lock_guard<std::mutex> lock(gAsyncXferMutex);
@@ -1818,7 +1962,12 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
   if (mrIds.size() < static_cast<size_t>(numIovs))
     return -1;
 
-  std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
+  std::shared_ptr<FlagcxTransferTask> task(new FlagcxTransferTask,
+                                           cleanupTransferTask);
+  task->conn = conn;
+  task->sliceList.reserve(numIovs);
+  const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+
   {
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
@@ -1830,20 +1979,22 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                           sizeVec[i]))
         return -1;
 
-      localEntries[i] = *entry;
+      if (entry->ibDevN != connIbDevN)
+        return -1;
+
+      FlagcxP2pMrHandleView *localMr =
+          reinterpret_cast<FlagcxP2pMrHandleView *>(entry->mhandle);
+      if (buildSlices<NixlSlicePolicy>(
+              task.get(),
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dstVec[i])),
+              descs[i].addr, sizeVec[i], localMr->lkey, descs[i].rkey,
+              IBV_WR_RDMA_WRITE) != 0) {
+        return -1;
+      }
     }
   }
 
   ensureAsyncWorkerStarted();
-
-  auto task = std::make_shared<AsyncTransferTask>();
-  task->conn = conn;
-  task->op = ASYNC_XFER_WRITE;
-  task->numIovs = numIovs;
-  task->dataVec = std::move(dstVec);
-  task->sizeVec = std::move(sizeVec);
-  task->descs = std::move(descs);
-  task->localEntries = std::move(localEntries);
 
   const uint64_t xferId = [&] {
     std::lock_guard<std::mutex> lock(gAsyncXferMutex);
@@ -1905,7 +2056,7 @@ bool flagcxP2pEngineXferStatus(FlagcxP2pConn *conn, uint64_t transferId) {
     std::lock_guard<std::mutex> lock(gAsyncXferMutex);
     auto it = gAsyncXferMap.find(transferId);
     if (it != gAsyncXferMap.end()) {
-      if (it->second->done.load(std::memory_order_acquire)) {
+      if (it->second->isAllDone()) {
         gAsyncXferMap.erase(it);
         return true;
       }
