@@ -9,6 +9,7 @@
 
 #include "flagcx_common.h"
 #include "flagcx_net_adaptor.h"
+#include "flagcx_p2p.h"
 #include "ib_common.h"
 #include "ibvwrap.h"
 #include "socket.h"
@@ -19,14 +20,65 @@
 #include <chrono>
 #include <mutex>
 #include <pthread.h>
+#include <stdint.h>
+#include <string>
 #include <string.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
+struct FlagcxSlice;
+
+extern struct ibv_cq *flagcxP2pPoolGetSharedCq(int ibDevN,
+                                               struct ibv_context *ctx);
+extern void flagcxP2pPoolRegisterQp(int ibDevN, void *sendComm,
+                                    struct ibv_qp *qp);
+extern void flagcxP2pPoolUnregisterQp(int ibDevN, struct ibv_qp *qp);
+extern flagcxResult_t flagcxP2pPoolSubmit(int ibDevN, void *sendComm,
+                                          FlagcxSlice **slices, int count);
+
 /* ------------------------------------------------------------------ */
 /*  Internal structs                                                   */
 /* ------------------------------------------------------------------ */
+
+struct FlagcxTransferTask {
+  std::atomic<uint64_t> sliceCount{0};
+  std::atomic<uint64_t> doneSliceCount{0};
+  std::vector<FlagcxSlice *> sliceList;
+
+  bool isAllDone() const {
+    auto total = sliceCount.load(std::memory_order_acquire);
+    auto done = doneSliceCount.load(std::memory_order_acquire);
+    return total > 0 && done >= total;
+  }
+};
+
+enum FlagcxSliceOp : uint8_t {
+  FLAGCX_SLICE_OP_WRITE = 0,
+  FLAGCX_SLICE_OP_READ = 1,
+};
+
+struct FlagcxSlice {
+  uint64_t srcVa;
+  uint64_t dstVa;
+  uint32_t length;
+  uint32_t lkey;
+  uint32_t rkey;
+  uint8_t opcode;
+  std::string peerNicPath;
+  FlagcxTransferTask *task;
+  volatile int *qpDepth;
+
+  inline void markSuccess() {
+    if (task)
+      task->doneSliceCount.fetch_add(1, std::memory_order_release);
+  }
+
+  inline void markFailed() {
+    if (task)
+      task->doneSliceCount.fetch_add(1, std::memory_order_release);
+  }
+};
 
 // Per-device context — created at init, holds eagerly allocated PD.
 // Passed as the `comm` parameter to regMr/deregMr when no connection exists.
@@ -70,63 +122,28 @@ struct flagcxP2pConnMeta {
   enum ibv_mtu mtu;
 };
 
-// P2P request — simplified from flagcxIbRequest
-#define FLAGCX_P2P_MAX_REQUESTS 256
-#define FLAGCX_P2P_REQ_UNUSED 0
-#define FLAGCX_P2P_REQ_IPUT 1
-#define FLAGCX_P2P_REQ_IGET 2
-#define FLAGCX_P2P_BATCH_POLL_SIZE 32
-#define FLAGCX_P2P_QPS_PER_CONN 4
-#define FLAGCX_P2P_IGET_BATCH_MAX_WR 64
-#define FLAGCX_P2P_READ_BATCH_WINDOW 8
-
-// flagcxIbCreateQp configures each P2P QP with 2 * MAX_REQUESTS send WRs.
-// The read engine round-robins an 8-batch window across four QPs, so one QP
-// can hold at most two fixed-size READ batches.
-static_assert(2 * FLAGCX_P2P_IGET_BATCH_MAX_WR <= 2 * MAX_REQUESTS,
-              "P2P READ batch window exceeds QP send queue capacity");
-static_assert(FLAGCX_P2P_READ_BATCH_WINDOW / FLAGCX_P2P_QPS_PER_CONN == 2,
-              "P2P READ batch capacity assumes two batches per QP");
-
-struct flagcxP2pRequest {
-  int type;
-  int events;                    // outstanding CQEs expected
-  struct ibv_cq *cq;             // CQ to poll for this request
-  struct flagcxP2pRequest *reqs; // back-pointer to owning reqs[] array
-  std::atomic<uint8_t> *reqDone; // pointer to owning comm's reqDone[] array
+struct flagcxP2pSliceReq {
+  FlagcxTransferTask task;
+  FlagcxSlice slice;
 };
 
-struct flagcxP2pChannel {
-  struct ibv_cq *cq;
-  struct flagcxIbQp qp;
-};
-
-// P2P send comm — fixed QP/CQ channels, blocking connect
+// Field order through `sock` mirrors core's FlagcxP2pCommView — do not reorder.
 struct flagcxP2pSendComm {
-  int ibDevN; // MUST be first field
+  int ibDevN;
   struct flagcxIbNetCommDevBase base;
-  struct flagcxP2pChannel channels[FLAGCX_P2P_QPS_PER_CONN];
+  struct flagcxIbQp qp_list_[kFlagcxP2pMaxQpsPerEngine];
   struct flagcxSocket sock;
-  struct flagcxP2pRequest reqs[FLAGCX_P2P_MAX_REQUESTS];
-  uint64_t putSignalScratchpad;
-  struct ibv_mr *putSignalScratchpadMr;
-  std::atomic<uint8_t> reqDone[FLAGCX_P2P_MAX_REQUESTS];
   std::atomic<uint32_t> nextChannel{0};
-  std::atomic<bool> cqError{false};
+  int numQps{0};  // resolved from flagcxP2pGlobalConfig().qpsPerConn at connect/accept
 };
 
-// P2P recv comm — symmetric with send comm so both sides can initiate transfers
 struct flagcxP2pRecvComm {
-  int ibDevN; // MUST be first field
+  int ibDevN;
   struct flagcxIbNetCommDevBase base;
-  struct flagcxP2pChannel channels[FLAGCX_P2P_QPS_PER_CONN];
+  struct flagcxIbQp qp_list_[kFlagcxP2pMaxQpsPerEngine];
   struct flagcxSocket sock;
-  struct flagcxP2pRequest reqs[FLAGCX_P2P_MAX_REQUESTS];
-  uint64_t putSignalScratchpad;
-  struct ibv_mr *putSignalScratchpadMr;
-  std::atomic<uint8_t> reqDone[FLAGCX_P2P_MAX_REQUESTS];
   std::atomic<uint32_t> nextChannel{0};
-  std::atomic<bool> cqError{false};
+  int numQps{0};  // resolved from flagcxP2pGlobalConfig().qpsPerConn at connect/accept
 };
 
 /* ------------------------------------------------------------------ */
@@ -136,149 +153,6 @@ struct flagcxP2pRecvComm {
 static struct flagcxP2pDevCtx flagcxP2pDevCtxs[MAX_IB_DEVS];
 static int flagcxP2pInitialized = 0;
 static pthread_mutex_t flagcxP2pInitLock = PTHREAD_MUTEX_INITIALIZER;
-
-/* ------------------------------------------------------------------ */
-/*  Background CQ Poller                                               */
-/* ------------------------------------------------------------------ */
-
-struct CqPollEntry {
-  struct ibv_cq *cq;
-  struct flagcxP2pRequest *reqs;
-  std::atomic<uint8_t> *reqDone;
-  std::atomic<bool> *cqError;
-  bool active;
-};
-
-struct CqPoller {
-  std::thread thread;
-  std::mutex mutex;
-  std::vector<CqPollEntry> entries;
-  std::atomic<bool> running{false};
-};
-
-static CqPoller gCqPoller;
-
-static void cqPollerFunc() {
-  while (gCqPoller.running.load(std::memory_order_relaxed)) {
-    bool anyWork = false;
-    {
-      // Keep unregister serialized with polling so CQ teardown cannot race a
-      // snapshot that still contains the CQ.
-      std::lock_guard<std::mutex> lock(gCqPoller.mutex);
-      for (auto &entry : gCqPoller.entries) {
-        if (!entry.active)
-          continue;
-
-        struct ibv_wc wcs[FLAGCX_P2P_BATCH_POLL_SIZE];
-        int nCqe = 0;
-        if (flagcxWrapIbvPollCq(entry.cq, FLAGCX_P2P_BATCH_POLL_SIZE, wcs,
-                                &nCqe) != flagcxSuccess) {
-          entry.cqError->store(true, std::memory_order_release);
-          continue;
-        }
-
-        for (int i = 0; i < nCqe; i++) {
-          if (wcs[i].status != IBV_WC_SUCCESS) {
-            WARN("NET/IB_P2P : CQ poller got error status %d for wr_id %lu",
-                 wcs[i].status, wcs[i].wr_id);
-            entry.cqError->store(true, std::memory_order_release);
-            break;
-          }
-          uint32_t idx = (uint32_t)wcs[i].wr_id;
-          if (idx >= FLAGCX_P2P_MAX_REQUESTS)
-            continue;
-
-          entry.reqs[idx].events--;
-          if (entry.reqs[idx].events == 0) {
-            entry.reqs[idx].type = FLAGCX_P2P_REQ_UNUSED;
-            entry.reqDone[idx].store(1, std::memory_order_release);
-          }
-        }
-        if (nCqe > 0)
-          anyWork = true;
-      }
-    }
-
-    if (!anyWork) {
-      std::this_thread::sleep_for(std::chrono::microseconds(1));
-    }
-  }
-}
-
-static void ensureCqPollerStarted() {
-  if (!gCqPoller.running.load(std::memory_order_acquire)) {
-    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
-    if (!gCqPoller.running.load(std::memory_order_relaxed)) {
-      gCqPoller.running.store(true, std::memory_order_release);
-      gCqPoller.thread = std::thread(cqPollerFunc);
-    }
-  }
-}
-
-static void cqPollerRegister(struct ibv_cq *cq, struct flagcxP2pRequest *reqs,
-                             std::atomic<uint8_t> *reqDone,
-                             std::atomic<bool> *cqError) {
-  ensureCqPollerStarted();
-  std::lock_guard<std::mutex> lock(gCqPoller.mutex);
-  gCqPoller.entries.push_back({cq, reqs, reqDone, cqError, true});
-}
-
-static void cqPollerStop() {
-  if (gCqPoller.running.load(std::memory_order_acquire)) {
-    gCqPoller.running.store(false, std::memory_order_release);
-    if (gCqPoller.thread.joinable()) {
-      gCqPoller.thread.join();
-    }
-    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
-    gCqPoller.entries.clear();
-  }
-}
-
-static void cqPollerUnregister(struct ibv_cq *cq) {
-  bool anyActive = false;
-  {
-    std::lock_guard<std::mutex> lock(gCqPoller.mutex);
-    for (auto &entry : gCqPoller.entries) {
-      if (entry.cq == cq) {
-        entry.active = false;
-      } else if (entry.active) {
-        anyActive = true;
-      }
-    }
-  }
-  if (!anyActive) {
-    cqPollerStop();
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Request helpers                                                    */
-/* ------------------------------------------------------------------ */
-
-static flagcxResult_t flagcxP2pGetRequest(struct flagcxP2pRequest *reqs,
-                                          std::atomic<uint8_t> *reqDone,
-                                          struct ibv_cq *cq, int type,
-                                          struct flagcxP2pRequest **req) {
-  for (int i = 0; i < FLAGCX_P2P_MAX_REQUESTS; i++) {
-    if (reqs[i].type == FLAGCX_P2P_REQ_UNUSED) {
-      reqs[i].type = type;
-      reqs[i].events = 0;
-      reqs[i].cq = cq;
-      reqs[i].reqs = reqs;
-      reqs[i].reqDone = reqDone;
-      reqDone[i].store(0, std::memory_order_relaxed);
-      *req = &reqs[i];
-      return flagcxSuccess;
-    }
-  }
-  WARN("NET/IB_P2P : unable to allocate request");
-  *req = NULL;
-  return flagcxInternalError;
-}
-
-static inline void flagcxP2pFreeRequest(struct flagcxP2pRequest *req) {
-  req->type = FLAGCX_P2P_REQ_UNUSED;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Init / Devices / Properties                                        */
@@ -420,13 +294,12 @@ static flagcxResult_t flagcxP2pListen(int dev, void *opaqueHandle,
 }
 
 static flagcxResult_t flagcxP2pReleasePd(int ibDevN);
-static void flagcxP2pDrainCq(struct ibv_cq *cq);
 
 // Helper: set up PD (from eager init), CQs, QPs, and GID for a connection
-static flagcxResult_t flagcxP2pSetupConn(int dev,
+static flagcxResult_t flagcxP2pSetupConn(int dev, void *outerComm,
                                          struct flagcxIbNetCommDevBase *base,
-                                         struct flagcxP2pChannel *channels,
-                                         int *outIbDevN) {
+                                         struct flagcxIbQp *qp_list,
+                                         int *outIbDevN, int numQps) {
   struct flagcxIbMergedDev *mergedDev = flagcxIbMergedDevs + dev;
   int ibDevN = mergedDev->devs[0]; // v1: single physical NIC
   *outIbDevN = ibDevN;
@@ -439,6 +312,18 @@ static flagcxResult_t flagcxP2pSetupConn(int dev,
   ibDev->pdRefs++;
   base->pd = ibDev->pd;
   pthread_mutex_unlock(&ibDev->lock);
+
+  // Step 0: pull the shared CQ from the per-ibDev WorkerPool. The pool is
+  // lazily created on first call (and lives for the process lifetime).
+  struct ibv_cq *sharedCq =
+      flagcxP2pPoolGetSharedCq(ibDevN, ibDev->context);
+  if (sharedCq == NULL) {
+    WARN("NET/IB_P2P : pool[%d] returned NULL shared CQ", ibDevN);
+    flagcxP2pReleasePd(ibDevN);
+    base->pd = NULL;
+    return flagcxInternalError;
+  }
+  base->cq = sharedCq;
 
   int accessFlags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
                     IBV_ACCESS_REMOTE_ATOMIC;
@@ -455,32 +340,25 @@ static flagcxResult_t flagcxP2pSetupConn(int dev,
                   res, setup_fail);
   base->gidInfo.linkLayer = ibDev->link;
 
-  // Create RC QPs with remote write, read, and atomic access.
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++) {
-    FLAGCXCHECKGOTO(flagcxWrapIbvCreateCq(&channels[i].cq, ibDev->context,
-                                          2 * FLAGCX_P2P_MAX_REQUESTS, NULL,
-                                          NULL, 0),
-                    res, setup_fail);
-    base->cq = channels[i].cq;
+  for (int i = 0; i < numQps; i++) {
     FLAGCXCHECKGOTO(
-        flagcxIbCreateQp(ibDev->portNum, base, accessFlags, &channels[i].qp),
+        flagcxIbCreateQp(ibDev->portNum, base, accessFlags, &qp_list[i]),
         res, setup_fail);
-    channels[i].qp.devIndex = 0;
+    qp_list[i].devIndex = 0;
+    flagcxP2pPoolRegisterQp(ibDevN, outerComm, qp_list[i].qp);
   }
 
   return flagcxSuccess;
 
 setup_fail:
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++) {
-    if (channels[i].qp.qp) {
-      flagcxWrapIbvDestroyQp(channels[i].qp.qp);
-      channels[i].qp.qp = NULL;
-    }
-    if (channels[i].cq) {
-      flagcxWrapIbvDestroyCq(channels[i].cq);
-      channels[i].cq = NULL;
+  for (int i = 0; i < numQps; i++) {
+    if (qp_list[i].qp) {
+      flagcxP2pPoolUnregisterQp(ibDevN, qp_list[i].qp);
+      flagcxWrapIbvDestroyQp(qp_list[i].qp);
+      qp_list[i].qp = NULL;
     }
   }
+  // Do not destroy sharedCq — owned by the pool.
   base->cq = NULL;
   flagcxP2pReleasePd(ibDevN);
   base->pd = NULL;
@@ -527,44 +405,25 @@ flagcxP2pTransitionQp(struct flagcxIbQp *qp,
   return flagcxSuccess;
 }
 
-static void flagcxP2pRegisterChannels(struct flagcxP2pChannel *channels,
-                                      struct flagcxP2pRequest *reqs,
-                                      std::atomic<uint8_t> *reqDone,
-                                      std::atomic<bool> *cqError) {
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    cqPollerRegister(channels[i].cq, reqs, reqDone, cqError);
-}
-
-static void flagcxP2pUnregisterChannels(struct flagcxP2pChannel *channels) {
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    if (channels[i].cq)
-      cqPollerUnregister(channels[i].cq);
-}
-
-static flagcxResult_t
-flagcxP2pDestroyChannels(struct flagcxP2pChannel *channels) {
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    flagcxP2pDrainCq(channels[i].cq);
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++) {
-    if (channels[i].qp.qp) {
-      FLAGCXCHECK(flagcxWrapIbvDestroyQp(channels[i].qp.qp));
-      channels[i].qp.qp = NULL;
-    }
-  }
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++) {
-    if (channels[i].cq) {
-      FLAGCXCHECK(flagcxWrapIbvDestroyCq(channels[i].cq));
-      channels[i].cq = NULL;
+static flagcxResult_t flagcxP2pDestroyQps(int ibDevN,
+                                          struct flagcxIbQp *qp_list,
+                                          int numQps) {
+  for (int i = 0; i < numQps; i++) {
+    if (qp_list[i].qp) {
+      flagcxP2pPoolUnregisterQp(ibDevN, qp_list[i].qp);
+      FLAGCXCHECK(flagcxWrapIbvDestroyQp(qp_list[i].qp));
+      qp_list[i].qp = NULL;
     }
   }
   return flagcxSuccess;
 }
 
-static inline struct flagcxP2pChannel *
-flagcxP2pNextChannel(struct flagcxP2pChannel *channels,
-                     std::atomic<uint32_t> *nextChannel) {
+static inline struct flagcxIbQp *
+flagcxP2pNextQp(struct flagcxIbQp *qp_list,
+                std::atomic<uint32_t> *nextChannel, int qpCount) {
+  uint32_t mod = (qpCount > 0) ? (uint32_t)qpCount : 1u;
   uint32_t idx = nextChannel->fetch_add(1, std::memory_order_relaxed);
-  return channels + (idx % FLAGCX_P2P_QPS_PER_CONN);
+  return qp_list + (idx % mod);
 }
 
 static flagcxResult_t flagcxP2pConnect(int dev, void *opaqueHandle,
@@ -579,9 +438,10 @@ static flagcxResult_t flagcxP2pConnect(int dev, void *opaqueHandle,
   FLAGCXCHECK(flagcxCalloc(&comm, 1));
   int ready = 0;
   auto connectStart = std::chrono::steady_clock::time_point();
-  struct flagcxP2pConnMeta localMeta[FLAGCX_P2P_QPS_PER_CONN];
-  struct flagcxP2pConnMeta remoteMeta[FLAGCX_P2P_QPS_PER_CONN];
+  struct flagcxP2pConnMeta localMeta[kFlagcxP2pMaxQpsPerEngine];
+  struct flagcxP2pConnMeta remoteMeta[kFlagcxP2pMaxQpsPerEngine];
   int localReady = 1, remoteReady = 0;
+  uint32_t localNumQps = 0, remoteNumQps = 0, agreedNumQps = 0;
 
   // TCP connect (blocking with timeout)
   FLAGCXCHECKGOTO(flagcxSocketInit(&comm->sock, &handle->connectAddr,
@@ -603,35 +463,50 @@ static flagcxResult_t flagcxP2pConnect(int dev, void *opaqueHandle,
     }
   }
 
-  // Set up PD, CQs, QPs
+  // numQps negotiation must happen before setup so we only create the
+  // QPs we'll actually use; both peers agree on min().
+  localNumQps = (uint32_t)flagcxP2pGlobalConfig().qpsPerConn;
+  if (localNumQps == 0 || localNumQps > (uint32_t)kFlagcxP2pMaxQpsPerEngine)
+    localNumQps = (uint32_t)kFlagcxP2pMaxQpsPerEngine;
   FLAGCXCHECKGOTO(
-      flagcxP2pSetupConn(dev, &comm->base, comm->channels, &comm->ibDevN), res,
+      flagcxSocketSend(&comm->sock, &localNumQps, sizeof(localNumQps)), res,
       connect_fail);
+  FLAGCXCHECKGOTO(
+      flagcxSocketRecv(&comm->sock, &remoteNumQps, sizeof(remoteNumQps)), res,
+      connect_fail);
+  if (remoteNumQps == 0 || remoteNumQps > (uint32_t)kFlagcxP2pMaxQpsPerEngine) {
+    WARN("NET/IB_P2P : peer advertised invalid numQps=%u (max=%d)",
+         remoteNumQps, kFlagcxP2pMaxQpsPerEngine);
+    res = flagcxInternalError;
+    goto connect_fail;
+  }
+  agreedNumQps = std::min(localNumQps, remoteNumQps);
+  if (localNumQps != remoteNumQps) {
+    INFO(FLAGCX_NET,
+         "NET/IB_P2P : numQps mismatch (local=%u remote=%u) — using min=%u",
+         localNumQps, remoteNumQps, agreedNumQps);
+  }
+  comm->numQps = (int)agreedNumQps;
 
-  // Exchange connection metadata
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    flagcxP2pBuildConnMeta(&localMeta[i], &comm->base, &comm->channels[i].qp,
-                           comm->ibDevN);
-  FLAGCXCHECKGOTO(flagcxSocketSend(&comm->sock, localMeta, sizeof(localMeta)),
+  FLAGCXCHECKGOTO(flagcxP2pSetupConn(dev, comm, &comm->base, comm->qp_list_,
+                                     &comm->ibDevN, comm->numQps),
                   res, connect_fail);
-  FLAGCXCHECKGOTO(flagcxSocketRecv(&comm->sock, remoteMeta, sizeof(remoteMeta)),
+
+  for (int i = 0; i < comm->numQps; i++)
+    flagcxP2pBuildConnMeta(&localMeta[i], &comm->base, &comm->qp_list_[i],
+                           comm->ibDevN);
+  FLAGCXCHECKGOTO(flagcxSocketSend(&comm->sock, localMeta,
+                                   comm->numQps * sizeof(localMeta[0])),
+                  res, connect_fail);
+  FLAGCXCHECKGOTO(flagcxSocketRecv(&comm->sock, remoteMeta,
+                                   comm->numQps * sizeof(remoteMeta[0])),
                   res, connect_fail);
 
   // Transition each matched QP to RTR then RTS.
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    FLAGCXCHECKGOTO(flagcxP2pTransitionQp(&comm->channels[i].qp, &comm->base,
+  for (int i = 0; i < comm->numQps; i++)
+    FLAGCXCHECKGOTO(flagcxP2pTransitionQp(&comm->qp_list_[i], &comm->base,
                                           &remoteMeta[i], comm->ibDevN),
                     res, connect_fail);
-
-  // Register putSignal scratchpad MR
-  comm->putSignalScratchpad = 0;
-  FLAGCXCHECKGOTO(
-      flagcxWrapIbvRegMr(&comm->putSignalScratchpadMr, comm->base.pd,
-                         &comm->putSignalScratchpad,
-                         sizeof(comm->putSignalScratchpad),
-                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                             IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC),
-      res, connect_fail);
 
   // Exchange ready
   FLAGCXCHECKGOTO(
@@ -641,16 +516,12 @@ static flagcxResult_t flagcxP2pConnect(int dev, void *opaqueHandle,
       flagcxSocketRecv(&comm->sock, &remoteReady, sizeof(remoteReady)), res,
       connect_fail);
 
-  flagcxP2pRegisterChannels(comm->channels, comm->reqs, comm->reqDone,
-                            &comm->cqError);
 
   *sendComm = comm;
   return flagcxSuccess;
 
 connect_fail:
-  if (comm->putSignalScratchpadMr)
-    flagcxWrapIbvDeregMr(comm->putSignalScratchpadMr);
-  flagcxP2pDestroyChannels(comm->channels);
+  flagcxP2pDestroyQps(comm->ibDevN, comm->qp_list_, comm->numQps);
   if (comm->base.pd)
     flagcxP2pReleasePd(comm->ibDevN);
   flagcxSocketClose(&comm->sock);
@@ -669,9 +540,10 @@ static flagcxResult_t flagcxP2pAccept(void *listenComm, void **recvComm) {
   // TCP accept (blocking, no timeout)
   flagcxResult_t res;
   int ready;
-  struct flagcxP2pConnMeta localMeta[FLAGCX_P2P_QPS_PER_CONN];
-  struct flagcxP2pConnMeta remoteMeta[FLAGCX_P2P_QPS_PER_CONN];
+  struct flagcxP2pConnMeta localMeta[kFlagcxP2pMaxQpsPerEngine];
+  struct flagcxP2pConnMeta remoteMeta[kFlagcxP2pMaxQpsPerEngine];
   int localReady = 1, remoteReady = 0;
+  uint32_t localNumQps = 0, remoteNumQps = 0, agreedNumQps = 0;
   FLAGCXCHECKGOTO(flagcxSocketInit(&comm->sock), res, accept_fail);
   FLAGCXCHECKGOTO(flagcxSocketAccept(&comm->sock, &lComm->sock), res,
                   accept_fail);
@@ -688,35 +560,50 @@ static flagcxResult_t flagcxP2pAccept(void *listenComm, void **recvComm) {
     return res;
   }
 
-  // Set up PD, CQs, QPs
-  FLAGCXCHECKGOTO(flagcxP2pSetupConn(lComm->dev, &comm->base, comm->channels,
-                                     &comm->ibDevN),
+  // accept side mirrors connect: recv numQps first, then send.
+  FLAGCXCHECKGOTO(
+      flagcxSocketRecv(&comm->sock, &remoteNumQps, sizeof(remoteNumQps)), res,
+      accept_cleanup);
+  localNumQps = (uint32_t)flagcxP2pGlobalConfig().qpsPerConn;
+  if (localNumQps == 0 || localNumQps > (uint32_t)kFlagcxP2pMaxQpsPerEngine)
+    localNumQps = (uint32_t)kFlagcxP2pMaxQpsPerEngine;
+  FLAGCXCHECKGOTO(
+      flagcxSocketSend(&comm->sock, &localNumQps, sizeof(localNumQps)), res,
+      accept_cleanup);
+  if (remoteNumQps == 0 || remoteNumQps > (uint32_t)kFlagcxP2pMaxQpsPerEngine) {
+    WARN("NET/IB_P2P : peer advertised invalid numQps=%u (max=%d)",
+         remoteNumQps, kFlagcxP2pMaxQpsPerEngine);
+    res = flagcxInternalError;
+    goto accept_cleanup;
+  }
+  agreedNumQps = std::min(localNumQps, remoteNumQps);
+  if (localNumQps != remoteNumQps) {
+    INFO(FLAGCX_NET,
+         "NET/IB_P2P : numQps mismatch (local=%u remote=%u) — using min=%u",
+         localNumQps, remoteNumQps, agreedNumQps);
+  }
+  comm->numQps = (int)agreedNumQps;
+
+  FLAGCXCHECKGOTO(flagcxP2pSetupConn(lComm->dev, comm, &comm->base,
+                                     comm->qp_list_, &comm->ibDevN,
+                                     comm->numQps),
                   res, accept_cleanup);
 
-  // Exchange connection metadata (accept receives first, then sends)
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    flagcxP2pBuildConnMeta(&localMeta[i], &comm->base, &comm->channels[i].qp,
+  for (int i = 0; i < comm->numQps; i++)
+    flagcxP2pBuildConnMeta(&localMeta[i], &comm->base, &comm->qp_list_[i],
                            comm->ibDevN);
-  FLAGCXCHECKGOTO(flagcxSocketRecv(&comm->sock, remoteMeta, sizeof(remoteMeta)),
+  FLAGCXCHECKGOTO(flagcxSocketRecv(&comm->sock, remoteMeta,
+                                   comm->numQps * sizeof(remoteMeta[0])),
                   res, accept_cleanup);
-  FLAGCXCHECKGOTO(flagcxSocketSend(&comm->sock, localMeta, sizeof(localMeta)),
+  FLAGCXCHECKGOTO(flagcxSocketSend(&comm->sock, localMeta,
+                                   comm->numQps * sizeof(localMeta[0])),
                   res, accept_cleanup);
 
   // Transition each matched QP to RTR then RTS.
-  for (int i = 0; i < FLAGCX_P2P_QPS_PER_CONN; i++)
-    FLAGCXCHECKGOTO(flagcxP2pTransitionQp(&comm->channels[i].qp, &comm->base,
+  for (int i = 0; i < comm->numQps; i++)
+    FLAGCXCHECKGOTO(flagcxP2pTransitionQp(&comm->qp_list_[i], &comm->base,
                                           &remoteMeta[i], comm->ibDevN),
                     res, accept_cleanup);
-
-  // Register putSignal scratchpad MR (symmetric with connect)
-  comm->putSignalScratchpad = 0;
-  FLAGCXCHECKGOTO(
-      flagcxWrapIbvRegMr(&comm->putSignalScratchpadMr, comm->base.pd,
-                         &comm->putSignalScratchpad,
-                         sizeof(comm->putSignalScratchpad),
-                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                             IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC),
-      res, accept_cleanup);
 
   // Exchange ready
   FLAGCXCHECKGOTO(
@@ -726,16 +613,12 @@ static flagcxResult_t flagcxP2pAccept(void *listenComm, void **recvComm) {
       flagcxSocketSend(&comm->sock, &localReady, sizeof(localReady)), res,
       accept_cleanup);
 
-  flagcxP2pRegisterChannels(comm->channels, comm->reqs, comm->reqDone,
-                            &comm->cqError);
 
   *recvComm = comm;
   return flagcxSuccess;
 
 accept_cleanup:
-  if (comm->putSignalScratchpadMr)
-    flagcxWrapIbvDeregMr(comm->putSignalScratchpadMr);
-  flagcxP2pDestroyChannels(comm->channels);
+  flagcxP2pDestroyQps(comm->ibDevN, comm->qp_list_, comm->numQps);
   if (comm->base.pd)
     flagcxP2pReleasePd(comm->ibDevN);
   flagcxSocketClose(&comm->sock);
@@ -747,100 +630,66 @@ accept_cleanup:
 /*  One-sided transfers: iput / iget / iputSignal                      */
 /* ------------------------------------------------------------------ */
 
-static flagcxResult_t flagcxP2pIput(void *sendComm, uint64_t srcOff,
-                                    uint64_t dstOff, size_t size, int srcRank,
-                                    int dstRank, void **srcHandles,
-                                    void **dstHandles, void **request) {
-  struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
-  struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles;
-  struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
-
-  struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, NULL,
-                                  FLAGCX_P2P_REQ_IPUT, &req));
-  struct flagcxP2pChannel *channel =
-      flagcxP2pNextChannel(comm->channels, &comm->nextChannel);
-  req->cq = channel->cq;
-
-  struct ibv_sge sge;
-  memset(&sge, 0, sizeof(sge));
-  sge.addr = src->baseVa + srcOff;
-  sge.length = (uint32_t)size;
-  if ((size_t)sge.length != size) {
-    WARN("NET/IB_P2P : iput size %zu exceeds 32-bit limit", size);
-    flagcxP2pFreeRequest(req);
+static flagcxResult_t flagcxP2pBuildSingleSliceReq(
+    struct flagcxP2pSendComm *comm, uint64_t localVa, uint64_t remoteVa,
+    size_t size, uint32_t lkey, uint32_t rkey, uint8_t opcode,
+    void **request) {
+  if ((uint32_t)size != size) {
+    WARN("NET/IB_P2P : single-op size %zu exceeds 32-bit limit", size);
     return flagcxInternalError;
   }
-  sge.lkey = src->lkey;
 
-  struct ibv_send_wr wr;
-  memset(&wr, 0, sizeof(wr));
-  wr.opcode = IBV_WR_RDMA_WRITE;
-  wr.send_flags = IBV_SEND_SIGNALED;
-  wr.wr_id = req - comm->reqs;
-  wr.wr.rdma.remote_addr = dst->baseVa + dstOff;
-  wr.wr.rdma.rkey = dst->rkey;
-  wr.sg_list = &sge;
-  wr.num_sge = 1;
+  auto *req = new struct flagcxP2pSliceReq;
+  req->slice.srcVa = localVa;
+  req->slice.dstVa = remoteVa;
+  req->slice.length = (uint32_t)size;
+  req->slice.lkey = lkey;
+  req->slice.rkey = rkey;
+  req->slice.opcode = opcode;
+  req->slice.peerNicPath = std::string();
+  req->slice.task = &req->task;
+  req->slice.qpDepth = NULL;
+  req->task.sliceList.push_back(&req->slice);
+  req->task.sliceCount.fetch_add(1, std::memory_order_release);
 
-  req->events = 1;
-  struct ibv_send_wr *bad_wr;
-  flagcxResult_t res = flagcxWrapIbvPostSend(channel->qp.qp, &wr, &bad_wr);
-  if (res != flagcxSuccess) {
-    flagcxP2pFreeRequest(req);
-    return res;
+  FlagcxSlice *slicePtr = &req->slice;
+  flagcxResult_t rc =
+      flagcxP2pPoolSubmit(comm->ibDevN, comm, &slicePtr, 1);
+  if (rc != flagcxSuccess) {
+    delete req;
+    return rc;
   }
 
   *request = req;
   return flagcxSuccess;
 }
 
+static flagcxResult_t flagcxP2pIput(void *sendComm, uint64_t srcOff,
+                                    uint64_t dstOff, size_t size, int srcRank,
+                                    int dstRank, void **srcHandles,
+                                    void **dstHandles, void **request) {
+  (void)srcRank;
+  (void)dstRank;
+  struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
+  struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles;
+  struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
+  return flagcxP2pBuildSingleSliceReq(
+      comm, src->baseVa + srcOff, dst->baseVa + dstOff, size, src->lkey,
+      dst->rkey, FLAGCX_SLICE_OP_WRITE, request);
+}
+
 static flagcxResult_t flagcxP2pIget(void *sendComm, uint64_t srcOff,
                                     uint64_t dstOff, size_t size, int srcRank,
                                     int dstRank, void **srcHandles,
                                     void **dstHandles, void **request) {
+  (void)srcRank;
+  (void)dstRank;
   struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
   struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles;
   struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
-
-  struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, NULL,
-                                  FLAGCX_P2P_REQ_IGET, &req));
-  struct flagcxP2pChannel *channel =
-      flagcxP2pNextChannel(comm->channels, &comm->nextChannel);
-  req->cq = channel->cq;
-
-  struct ibv_sge sge;
-  memset(&sge, 0, sizeof(sge));
-  sge.addr = dst->baseVa + dstOff;
-  sge.length = (uint32_t)size;
-  if ((size_t)sge.length != size) {
-    WARN("NET/IB_P2P : iget size %zu exceeds 32-bit limit", size);
-    flagcxP2pFreeRequest(req);
-    return flagcxInternalError;
-  }
-  sge.lkey = dst->lkey;
-
-  struct ibv_send_wr wr;
-  memset(&wr, 0, sizeof(wr));
-  wr.opcode = IBV_WR_RDMA_READ;
-  wr.send_flags = IBV_SEND_SIGNALED;
-  wr.wr_id = req - comm->reqs;
-  wr.wr.rdma.remote_addr = src->baseVa + srcOff;
-  wr.wr.rdma.rkey = src->rkey;
-  wr.sg_list = &sge;
-  wr.num_sge = 1;
-
-  req->events = 1;
-  struct ibv_send_wr *bad_wr;
-  flagcxResult_t res = flagcxWrapIbvPostSend(channel->qp.qp, &wr, &bad_wr);
-  if (res != flagcxSuccess) {
-    flagcxP2pFreeRequest(req);
-    return res;
-  }
-
-  *request = req;
-  return flagcxSuccess;
+  return flagcxP2pBuildSingleSliceReq(
+      comm, dst->baseVa + dstOff, src->baseVa + srcOff, size, dst->lkey,
+      src->rkey, FLAGCX_SLICE_OP_READ, request);
 }
 
 static flagcxResult_t
@@ -848,139 +697,142 @@ flagcxP2pIgetBatch(void *sendComm, int count, const uint64_t *srcOffs,
                    const uint64_t *dstOffs, const size_t *sizes, int srcRank,
                    int dstRank, void *const *srcHandles,
                    void *const *dstHandles, void **request) {
+  (void)srcRank;
+  (void)dstRank;
   struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
-  if (count <= 0 || count > FLAGCX_P2P_IGET_BATCH_MAX_WR || srcOffs == NULL ||
+  const int maxWrPerPost = (int)flagcxP2pGlobalConfig().maxWrPerPost;
+  if (count <= 0 || count > maxWrPerPost || srcOffs == NULL ||
       dstOffs == NULL || sizes == NULL || srcHandles == NULL ||
       dstHandles == NULL || request == NULL) {
-    WARN("NET/IB_P2P : invalid igetBatch arguments, count %d", count);
+    WARN("NET/IB_P2P : invalid igetBatch arguments, count %d (max %d)", count,
+         maxWrPerPost);
     return flagcxInternalError;
   }
 
-  struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, NULL,
-                                  FLAGCX_P2P_REQ_IGET, &req));
-  struct flagcxP2pChannel *channel =
-      flagcxP2pNextChannel(comm->channels, &comm->nextChannel);
-  req->cq = channel->cq;
-
-  struct ibv_send_wr wrs[FLAGCX_P2P_IGET_BATCH_MAX_WR];
-  struct ibv_sge sges[FLAGCX_P2P_IGET_BATCH_MAX_WR];
-  memset(wrs, 0, sizeof(wrs));
-  memset(sges, 0, sizeof(sges));
-
+  auto *req = new struct flagcxP2pSliceReq;
+  req->task.sliceList.reserve(count);
   for (int i = 0; i < count; i++) {
-    if (srcHandles[i] == NULL || dstHandles[i] == NULL) {
-      WARN("NET/IB_P2P : igetBatch handle %d is NULL", i);
-      flagcxP2pFreeRequest(req);
+    if (srcHandles[i] == NULL || dstHandles[i] == NULL ||
+        (uint32_t)sizes[i] != sizes[i]) {
+      WARN("NET/IB_P2P : igetBatch slice %d invalid", i);
+      for (auto *s : req->task.sliceList)
+        delete s;
+      delete req;
       return flagcxInternalError;
     }
-
-    struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles[i];
-    struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles[i];
-
-    sges[i].addr = dst->baseVa + dstOffs[i];
-    sges[i].length = (uint32_t)sizes[i];
-    if ((size_t)sges[i].length != sizes[i]) {
-      WARN("NET/IB_P2P : igetBatch size %zu exceeds 32-bit limit", sizes[i]);
-      flagcxP2pFreeRequest(req);
-      return flagcxInternalError;
-    }
-    sges[i].lkey = dst->lkey;
-
-    wrs[i].opcode = IBV_WR_RDMA_READ;
-    wrs[i].send_flags =
-        i == count - 1 ? IBV_SEND_SIGNALED : 0; // final CQE tracks batch
-    wrs[i].wr_id = i == count - 1 ? req - comm->reqs : 0;
-    wrs[i].wr.rdma.remote_addr = src->baseVa + srcOffs[i];
-    wrs[i].wr.rdma.rkey = src->rkey;
-    wrs[i].sg_list = &sges[i];
-    wrs[i].num_sge = 1;
-    wrs[i].next = i + 1 < count ? &wrs[i + 1] : NULL;
+    auto *src = (struct flagcxP2pMrHandle *)srcHandles[i];
+    auto *dst = (struct flagcxP2pMrHandle *)dstHandles[i];
+    auto *s = new FlagcxSlice{dst->baseVa + dstOffs[i],
+                              src->baseVa + srcOffs[i],
+                              (uint32_t)sizes[i],
+                              dst->lkey,
+                              src->rkey,
+                              FLAGCX_SLICE_OP_READ,
+                              std::string(),
+                              &req->task,
+                              NULL};
+    req->task.sliceList.push_back(s);
+    req->task.sliceCount.fetch_add(1, std::memory_order_release);
   }
 
-  req->events = 1;
-  struct ibv_send_wr *bad_wr;
-  flagcxResult_t res = flagcxWrapIbvPostSend(channel->qp.qp, &wrs[0], &bad_wr);
-  if (res != flagcxSuccess) {
-    flagcxP2pFreeRequest(req);
-    return res;
+  flagcxResult_t rc = flagcxP2pPoolSubmit(comm->ibDevN, comm,
+                                          req->task.sliceList.data(), count);
+  if (rc != flagcxSuccess) {
+    for (auto *s : req->task.sliceList)
+      delete s;
+    delete req;
+    return rc;
   }
-
   *request = req;
   return flagcxSuccess;
 }
 
-static flagcxResult_t
-flagcxP2pIputSignal(void *sendComm, uint64_t srcOff, uint64_t dstOff,
-                    size_t size, int srcRank, int dstRank, void **srcHandles,
-                    void **dstHandles, uint64_t signalOff, void **signalHandles,
-                    uint64_t signalValue, void **request) {
+static flagcxResult_t flagcxP2pIputSignal(void *, uint64_t, uint64_t, size_t,
+                                          int, int, void **, void **, uint64_t,
+                                          void **, uint64_t, void **) {
+  WARN("NET/IB_P2P : iputSignal not supported");
+  return flagcxInternalError;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Slice batch: pool worker passes the chosen QP. wr_id = ptr|1.      */
+/* ------------------------------------------------------------------ */
+
+static inline uint32_t flagcxSliceOpcodeToVerbs(uint8_t op) {
+  return op == FLAGCX_SLICE_OP_READ ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+}
+
+extern "C" flagcxResult_t flagcxP2pSliceBatch(void *sendComm,
+                                              struct ibv_qp *qp, int count,
+                                              FlagcxSlice **slices) {
   struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
-  struct flagcxP2pMrHandle *signalInfo =
-      (struct flagcxP2pMrHandle *)signalHandles;
-
-  struct flagcxP2pRequest *req;
-  FLAGCXCHECK(flagcxP2pGetRequest(comm->reqs, comm->reqDone, NULL,
-                                  FLAGCX_P2P_REQ_IPUT, &req));
-  struct flagcxP2pChannel *channel =
-      flagcxP2pNextChannel(comm->channels, &comm->nextChannel);
-  req->cq = channel->cq;
-
-  bool chainData = (size > 0 && srcHandles != NULL && dstHandles != NULL);
-
-  struct ibv_sge sge[2];
-  struct ibv_send_wr wr[2];
-  memset(sge, 0, sizeof(sge));
-  memset(wr, 0, sizeof(wr));
-
-  // wr[0]: RDMA WRITE for data (unsignaled, chained to wr[1])
-  if (chainData) {
-    struct flagcxP2pMrHandle *src = (struct flagcxP2pMrHandle *)srcHandles;
-    struct flagcxP2pMrHandle *dst = (struct flagcxP2pMrHandle *)dstHandles;
-
-    sge[0].addr = src->baseVa + srcOff;
-    sge[0].length = (uint32_t)size;
-    if ((size_t)sge[0].length != size) {
-      WARN("NET/IB_P2P : iputSignal size %zu exceeds 32-bit limit", size);
-      flagcxP2pFreeRequest(req);
-      return flagcxInternalError;
-    }
-    sge[0].lkey = src->lkey;
-
-    wr[0].opcode = IBV_WR_RDMA_WRITE;
-    wr[0].send_flags = 0; // unsignaled
-    wr[0].wr.rdma.remote_addr = dst->baseVa + dstOff;
-    wr[0].wr.rdma.rkey = dst->rkey;
-    wr[0].sg_list = &sge[0];
-    wr[0].num_sge = 1;
-    wr[0].next = &wr[1]; // chain to atomic
+  const char *opLabel =
+      (slices != NULL && count > 0 && slices[0] != NULL &&
+       slices[0]->opcode == FLAGCX_SLICE_OP_READ)
+          ? "READ"
+          : "WRITE";
+  const int maxWrPerPost = (int)flagcxP2pGlobalConfig().maxWrPerPost;
+  if (count <= 0 || count > maxWrPerPost || slices == NULL ||
+      qp == NULL || comm == NULL) {
+    WARN("NET/IB_P2P : invalid sliceBatch arguments (op=%s, count=%d, qp=%p, "
+         "max=%d)",
+         opLabel, count, (void *)qp, maxWrPerPost);
+    return flagcxInternalError;
   }
 
-  // wr[1]: ATOMIC FETCH_AND_ADD for signal (signaled)
-  sge[1].addr = (uintptr_t)&comm->putSignalScratchpad;
-  sge[1].length = sizeof(comm->putSignalScratchpad);
-  sge[1].lkey = comm->putSignalScratchpadMr->lkey;
+  // count can be up to flagcxP2pGlobalConfig().maxWrPerPost (default 256,
+  // bounded at 1024). Heap-allocate to keep the stack small.
+  std::vector<struct ibv_send_wr> wrs(count);
+  std::vector<struct ibv_sge> sges(count);
 
-  wr[1].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
-  wr[1].send_flags = IBV_SEND_SIGNALED;
-  wr[1].wr_id = req - comm->reqs;
-  wr[1].wr.atomic.remote_addr = signalInfo->baseVa + signalOff;
-  wr[1].wr.atomic.rkey = signalInfo->rkey;
-  wr[1].wr.atomic.compare_add = signalValue;
-  wr[1].sg_list = &sge[1];
-  wr[1].num_sge = 1;
-  wr[1].next = NULL;
+  for (int i = 0; i < count; i++) {
+    FlagcxSlice *s = slices[i];
+    if (s == NULL) {
+      WARN("NET/IB_P2P : sliceBatch slice[%d] is NULL", i);
+      for (int k = 0; k < i; k++)
+        slices[k]->markFailed();
+      for (int k = i; k < count; k++)
+        if (slices[k])
+          slices[k]->markFailed();
+      return flagcxInternalError;
+    }
 
-  req->events = 1;
-  struct ibv_send_wr *bad_wr;
-  flagcxResult_t res = flagcxWrapIbvPostSend(
-      channel->qp.qp, chainData ? &wr[0] : &wr[1], &bad_wr);
+    sges[i].addr = s->srcVa;
+    sges[i].length = s->length;
+    sges[i].lkey = s->lkey;
+
+    wrs[i].opcode = flagcxSliceOpcodeToVerbs(s->opcode);
+    wrs[i].send_flags = IBV_SEND_SIGNALED;
+    wrs[i].wr_id = ((uintptr_t)s) | 1ull;
+    wrs[i].wr.rdma.remote_addr = s->dstVa;
+    wrs[i].wr.rdma.rkey = s->rkey;
+    wrs[i].sg_list = &sges[i];
+    wrs[i].num_sge = 1;
+    wrs[i].next = (i + 1 < count) ? &wrs[i + 1] : NULL;
+  }
+
+  struct ibv_send_wr *bad_wr = NULL;
+  flagcxResult_t res = flagcxWrapIbvPostSend(qp, &wrs[0], &bad_wr);
   if (res != flagcxSuccess) {
-    flagcxP2pFreeRequest(req);
+    int failedFrom = 0;
+    if (bad_wr != NULL) {
+      ptrdiff_t off = bad_wr - &wrs[0];
+      if (off >= 0 && off < count)
+        failedFrom = (int)off;
+    }
+    // Slices in [failedFrom..count) never went on the wire — roll back
+    // their share of the pool's qpDepth pre-bump so the gate doesn't leak.
+    for (int k = failedFrom; k < count; k++) {
+      if (slices[k]->qpDepth != NULL)
+        __sync_fetch_and_sub(slices[k]->qpDepth, 1);
+      slices[k]->markFailed();
+    }
+    WARN("NET/IB_P2P : sliceBatch ibv_post_send failed (op=%s, count=%d, "
+         "failedFrom=%d)",
+         opLabel, count, failedFrom);
     return res;
   }
 
-  *request = req;
   return flagcxSuccess;
 }
 
@@ -988,25 +840,36 @@ flagcxP2pIputSignal(void *sendComm, uint64_t srcOff, uint64_t dstOff,
 /*  Test                                                               */
 /* ------------------------------------------------------------------ */
 
+// Single-slice path uses the wrapper's embedded `slice`; batch path
+// heap-allocates each — distinguish by address.
+static inline void flagcxP2pFreeSliceReq(struct flagcxP2pSliceReq *req) {
+  if (!req)
+    return;
+  for (auto *s : req->task.sliceList) {
+    if (s != &req->slice)
+      delete s;
+  }
+  delete req;
+}
+
 static flagcxResult_t flagcxP2pTest(void *request, int *done, int *sizes) {
   *done = 0;
-  struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)request;
-  if (req == NULL || req->type == FLAGCX_P2P_REQ_UNUSED) {
+  if (sizes)
+    *sizes = 0;
+  if (request == NULL) {
     *done = 1;
     return flagcxSuccess;
   }
-
-  uint32_t idx = (uint32_t)(req - req->reqs);
-  if (idx >= FLAGCX_P2P_MAX_REQUESTS) {
-    WARN("NET/IB_P2P : invalid request index %u in test()", idx);
-    return flagcxInternalError;
-  }
-
-  if (req->reqDone[idx].load(std::memory_order_acquire)) {
-    req->reqDone[idx].store(0, std::memory_order_relaxed);
+  auto *req = static_cast<struct flagcxP2pSliceReq *>(request);
+  if (req->task.isAllDone()) {
     *done = 1;
-    if (sizes)
-      *sizes = 0;
+    if (sizes) {
+      uint64_t total = 0;
+      for (auto *s : req->task.sliceList)
+        total += s->length;
+      *sizes = (int)std::min<uint64_t>(total, (uint64_t)INT32_MAX);
+    }
+    flagcxP2pFreeSliceReq(req);
   }
   return flagcxSuccess;
 }
@@ -1016,21 +879,16 @@ static flagcxResult_t flagcxP2pTestBatch(void **requests, int nRequests,
   int completed = 0;
   for (int i = 0; i < nRequests; i++) {
     doneFlags[i] = 0;
-    struct flagcxP2pRequest *req = (struct flagcxP2pRequest *)requests[i];
-    if (req == NULL || req->type == FLAGCX_P2P_REQ_UNUSED) {
+    auto *req = static_cast<struct flagcxP2pSliceReq *>(requests[i]);
+    if (req == NULL) {
       doneFlags[i] = 1;
       completed++;
       continue;
     }
-
-    uint32_t idx = (uint32_t)(req - req->reqs);
-    if (idx >= FLAGCX_P2P_MAX_REQUESTS)
-      continue;
-
-    if (req->reqDone[idx].load(std::memory_order_acquire)) {
-      req->reqDone[idx].store(0, std::memory_order_relaxed);
+    if (req->task.isAllDone()) {
       doneFlags[i] = 1;
       completed++;
+      flagcxP2pFreeSliceReq(req);
     }
   }
   *doneCount = completed;
@@ -1059,26 +917,10 @@ static flagcxResult_t flagcxP2pReleasePd(int ibDevN) {
   return flagcxSuccess;
 }
 
-// Helper: drain CQ before destroying resources
-static void flagcxP2pDrainCq(struct ibv_cq *cq) {
-  if (!cq)
-    return;
-  struct ibv_wc wcs[64];
-  int nCqe = 0;
-  for (int i = 0; i < 16; i++) {
-    flagcxWrapIbvPollCq(cq, 64, wcs, &nCqe);
-    if (nCqe == 0)
-      break;
-  }
-}
-
 static flagcxResult_t flagcxP2pCloseSend(void *sendComm) {
   struct flagcxP2pSendComm *comm = (struct flagcxP2pSendComm *)sendComm;
   if (comm) {
-    flagcxP2pUnregisterChannels(comm->channels);
-    FLAGCXCHECK(flagcxP2pDestroyChannels(comm->channels));
-    if (comm->putSignalScratchpadMr)
-      FLAGCXCHECK(flagcxWrapIbvDeregMr(comm->putSignalScratchpadMr));
+    FLAGCXCHECK(flagcxP2pDestroyQps(comm->ibDevN, comm->qp_list_, comm->numQps));
     FLAGCXCHECK(flagcxP2pReleasePd(comm->ibDevN));
     FLAGCXCHECK(flagcxSocketClose(&comm->sock));
     free(comm);
@@ -1089,10 +931,7 @@ static flagcxResult_t flagcxP2pCloseSend(void *sendComm) {
 static flagcxResult_t flagcxP2pCloseRecv(void *recvComm) {
   struct flagcxP2pRecvComm *comm = (struct flagcxP2pRecvComm *)recvComm;
   if (comm) {
-    flagcxP2pUnregisterChannels(comm->channels);
-    FLAGCXCHECK(flagcxP2pDestroyChannels(comm->channels));
-    if (comm->putSignalScratchpadMr)
-      FLAGCXCHECK(flagcxWrapIbvDeregMr(comm->putSignalScratchpadMr));
+    FLAGCXCHECK(flagcxP2pDestroyQps(comm->ibDevN, comm->qp_list_, comm->numQps));
     FLAGCXCHECK(flagcxP2pReleasePd(comm->ibDevN));
     FLAGCXCHECK(flagcxSocketClose(&comm->sock));
     free(comm);

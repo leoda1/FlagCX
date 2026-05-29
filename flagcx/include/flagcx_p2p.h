@@ -26,6 +26,8 @@
 #define FLAGCX_P2P_DESC_SIZE 64
 #define FLAGCX_P2P_IPC_INFO_SIZE 128
 
+constexpr int kFlagcxP2pMaxQpsPerEngine = 8;
+
 /* ------------------------------------------------------------------ */
 /*  Opaque handle types                                               */
 /* ------------------------------------------------------------------ */
@@ -423,5 +425,58 @@ int flagcxP2pEngineGetIpcInfo(FlagcxP2pEngine *engine, uintptr_t addr,
  */
 int flagcxP2pEngineUpdateIpcInfo(char *ipcBuf, uintptr_t addr,
                                  uintptr_t baseAddr, size_t size);
+
+/* ================================================================== */
+/*  Global runtime configuration                                      */
+/* ================================================================== */
+
+struct FlagcxP2pGlobalConfig {
+  /* Worker pool / QP topology */
+  int qpsPerConn = 4;        /* FLAGCX_P2P_QPS_PER_CONN          */
+  int workersPerPool = 2;    /* FLAGCX_P2P_WORKERS_PER_POOL      */
+  int shardCount = 8;        /* FLAGCX_P2P_SHARD_COUNT           */
+
+  /* CQ / WR / completion-queue depth */
+  size_t sharedCqDepth = 4096;  /* FLAGCX_P2P_CQ_DEPTH           */
+  size_t maxWrPerPost = 256;    /* FLAGCX_P2P_MAX_WR_PER_POST    */
+  size_t maxRequests = 256;     /* FLAGCX_P2P_MAX_REQUESTS       */
+  size_t batchPollSize = 32;    /* FLAGCX_P2P_BATCH_POLL_SIZE    */
+  size_t readBatchWindow = 8;   /* FLAGCX_P2P_READ_BATCH_WINDOW  */
+
+  /* Slice cut policy */
+  size_t sliceSize = 64 * 1024;     /* FLAGCX_P2P_SLICE_SIZE      */
+  size_t fragmentLimit = 4 * 1024;  /* FLAGCX_P2P_FRAGMENT_LIMIT  */
+
+  /* IB QP attributes — verbs-clean (plain int) so this header does
+     not pull <infiniband/verbs.h>. */
+  size_t maxSge = 4;            /* FLAGCX_P2P_MAX_SGE             */
+  size_t maxInline = 64;        /* FLAGCX_P2P_MAX_INLINE          */
+  uint8_t ibPort = 1;           /* FLAGCX_P2P_IB_PORT             */
+  int gidIndex = -1;            /* FLAGCX_P2P_GID_INDEX (-1=auto) */
+  int mtuLength = 4096;         /* FLAGCX_P2P_MTU                 */
+  int ibTrafficClass = -1;      /* FLAGCX_P2P_IB_TC (-1=off)      */
+  int retryCnt = 7;             /* FLAGCX_P2P_RETRY_CNT           */
+
+  /* Notification */
+  int notifMaxPeers = 64;       /* FLAGCX_P2P_NOTIF_MAX_PEERS     */
+
+  /* Misc */
+  bool enableDestDeviceAffinity = false; /* FLAGCX_P2P_DEST_DEV_AFFINITY */
+};
+
+/* Returns the lazy-loaded singleton (mooncake::globalConfig() shape).
+   First call materializes the struct and parses env vars exactly once. */
+const FlagcxP2pGlobalConfig &flagcxP2pGlobalConfig();
+
+/* Logs the resolved config once. Implicitly invoked at first
+   flagcxP2pGlobalConfig() call. */
+void flagcxP2pDumpGlobalConfig();
+
+/* Clamp size-limited fields against ibv_query_device() results — call
+   once from the adaptor's init path after IB attributes are known. The
+   four uint32 inputs are the obvious ibv_device_attr counterparts; we
+   take plain ints to keep verbs out of this header. */
+void flagcxP2pClampToDeviceLimits(uint32_t maxQpWr, uint32_t maxSge,
+                                  uint32_t maxCqe, uint32_t maxQp);
 
 #endif /* FLAGCX_P2P_H_ */
