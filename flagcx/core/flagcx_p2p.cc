@@ -18,6 +18,7 @@
 #include "flagcx_mr_registry.h"
 #include "flagcx_net.h"
 #include "flagcx_net_adaptor.h"
+#include "flagcx_p2p_accl.h"
 #include "ib_common.h"
 #include "ibvwrap.h"
 #include "p2p_topo.h"
@@ -38,6 +39,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <string>
+#include <strings.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -262,6 +264,8 @@ struct FlagcxP2pListener {
 };
 
 struct FlagcxP2pEngine {
+  /* Transport tag — must stay the first member (see flagcx_p2p_accl.h). */
+  uint32_t kind = FLAGCX_P2P_KIND_IBRC;
   struct flagcxNetAdaptor *adaptor;
   struct flagcxP2pTopoManager *topoMgr;
   int nDevs;
@@ -298,6 +302,8 @@ struct FlagcxP2pEngine {
 };
 
 struct FlagcxP2pConn {
+  /* Transport tag — must stay the first member (see flagcx_p2p_accl.h). */
+  uint32_t kind = FLAGCX_P2P_KIND_IBRC;
   FlagcxP2pEngine *engine;
   void *sendComm;
   void *recvComm;
@@ -2034,6 +2040,21 @@ static int bootstrapExchangeDescTable(struct bootstrapState *bsState,
 }
 
 FlagcxP2pEngine *flagcxP2pEngineCreate() {
+  /* FLAGCX_P2P_TRANSPORT=accl routes the whole engine to the ACCL
+     (accl::barex) transport — required on PPU+vsolar hosts. Default is
+     the existing ibrc path; every entry point below checks the engine/
+     conn kind tag and forwards, so callers see one unchanged API. */
+  const char *transport = flagcxGetEnv("FLAGCX_P2P_TRANSPORT");
+  if (transport != NULL && strcasecmp(transport, "accl") == 0) {
+#ifdef USE_ACCL_BAREX
+    return flagcxAcclEngineCreate();
+#else
+    WARN("FLAGCX_P2P_TRANSPORT=accl but FlagCX was built without "
+         "USE_ACCL_BAREX=1");
+    return NULL;
+#endif
+  }
+
   /* Ensure MR registry is ready (only needed for sorted-lookup mode) */
   if (flagcxParamMrSortedLookup()) {
     if (flagcxMrRegistryGlobalInit() != flagcxSuccess)
@@ -2142,6 +2163,8 @@ FlagcxP2pEngine *flagcxP2pEngineCreate() {
 void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
   if (engine == NULL)
     return;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineDestroy(engine);
 
   flagcxP2pEngineStopAccept(engine);
   if (engine->notifListenActive) {
@@ -2289,6 +2312,8 @@ void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
 void flagcxP2pEngineStopAccept(FlagcxP2pEngine *engine) {
   if (engine == NULL)
     return;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineStopAccept(engine);
 
   engine->stopAccept.store(true, std::memory_order_release);
   engine->stopNotif = true;
@@ -2400,6 +2425,9 @@ FlagcxP2pConn *flagcxP2pEngineConnect(FlagcxP2pEngine *engine,
                                       int remotePort, bool sameProcess) {
   if (engine == NULL || ipAddr == NULL)
     return NULL;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineConnect(engine, ipAddr, remoteGpuIdx, remotePort,
+                                   sameProcess);
 
   const int netDev = chooseEngineNetDev(engine);
 
@@ -2508,6 +2536,9 @@ FlagcxP2pConn *flagcxP2pEngineAccept(FlagcxP2pEngine *engine, char *ipAddrBuf,
                                      size_t ipAddrBufLen, int *remoteGpuIdx) {
   if (engine == NULL || ipAddrBuf == NULL || remoteGpuIdx == NULL)
     return NULL;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineAccept(engine, ipAddrBuf, ipAddrBufLen,
+                                  remoteGpuIdx);
   if (engine->stopAccept.load(std::memory_order_acquire))
     return NULL;
 
@@ -2615,6 +2646,8 @@ int flagcxP2pEngineStartListener(FlagcxP2pConn *conn) {
 void flagcxP2pEngineConnDestroy(FlagcxP2pConn *conn) {
   if (conn == NULL)
     return;
+  if (flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineConnDestroy(conn);
 
   if (conn->sendComm && conn->sendComm != conn->recvComm) {
     conn->engine->adaptor->closeSend(conn->sendComm);
@@ -2629,6 +2662,8 @@ void flagcxP2pEngineConnDestroy(FlagcxP2pConn *conn) {
 }
 
 bool flagcxP2pEngineConnIsLocal(FlagcxP2pConn *conn) {
+  if (conn != NULL && flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineConnIsLocal(conn);
   return conn != NULL && conn->isLocal;
 }
 
@@ -2636,6 +2671,8 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
                        FlagcxP2pMr &mrId) {
   if (engine == NULL || data == 0)
     return -1;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineReg(engine, data, size, mrId);
 
   if (!flagcxParamMrSortedLookup()) {
     /* Legacy: mutex + hash maps */
@@ -2769,6 +2806,8 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
 void flagcxP2pEngineMrDestroy(FlagcxP2pEngine *engine, FlagcxP2pMr mr) {
   if (engine == NULL)
     return;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineMrDestroy(engine, mr);
 
   if (!flagcxParamMrSortedLookup()) {
     /* Legacy: mutex + hash maps */
@@ -2826,6 +2865,8 @@ int flagcxP2pEnginePrepareDesc(FlagcxP2pEngine *engine, FlagcxP2pMr mr,
                                const void *data, size_t size, char *descBuf) {
   if (engine == NULL || data == NULL || descBuf == NULL)
     return -1;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEnginePrepareDesc(engine, mr, data, size, descBuf);
 
   if (!flagcxParamMrSortedLookup()) {
     /* Legacy: mutex + hash lookup */
@@ -2934,6 +2975,8 @@ int flagcxP2pEngineUpdateDesc(FlagcxP2pRdmaDesc &desc, uint64_t remoteAddr,
 int flagcxP2pEngineRead(FlagcxP2pConn *conn, FlagcxP2pMr mr, const void *data,
                         size_t size, FlagcxP2pRdmaDesc desc,
                         uint64_t *transferId) {
+  if (conn != NULL && flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineRead(conn, mr, data, size, desc, transferId);
   (void)mr;
   if (conn == NULL || data == NULL || transferId == NULL)
     return -1;
@@ -2994,6 +3037,9 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
                               std::vector<FlagcxP2pRdmaDesc> descs, int numIovs,
                               uint64_t *transferId,
                               std::vector<char *> ipcBufs) {
+  if (conn != NULL && flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineReadVector(conn, mrIds, dstVec, sizeVec, descs,
+                                      numIovs, transferId);
   if (conn == NULL || numIovs <= 0 || transferId == NULL) {
     fprintf(stderr,
             "[FlagCX P2P] ReadVector early exit: invalid args (conn=%p, "
@@ -3070,6 +3116,8 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
 int flagcxP2pEngineWrite(FlagcxP2pConn *conn, FlagcxP2pMr mr, const void *data,
                          size_t size, FlagcxP2pRdmaDesc desc,
                          uint64_t *transferId) {
+  if (conn != NULL && flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineWrite(conn, mr, data, size, desc, transferId);
   (void)mr;
   if (conn == NULL || data == NULL || transferId == NULL)
     return -1;
@@ -3131,6 +3179,9 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                                const std::vector<FlagcxP2pRdmaDesc> &descs,
                                int numIovs, uint64_t *transferId,
                                const std::vector<char *> &ipcBufs) {
+  if (conn != NULL && flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineWriteVector(conn, mrIds, dstVec, sizeVec, descs,
+                                       numIovs, transferId);
   if (conn == NULL || numIovs <= 0 || transferId == NULL)
     return -1;
 
@@ -3210,6 +3261,8 @@ int flagcxP2pEngineRecv(FlagcxP2pConn *conn, FlagcxP2pMr mr, void *data,
 bool flagcxP2pEngineXferStatus(FlagcxP2pConn *conn, uint64_t transferId) {
   if (conn == NULL)
     return true;
+  if (flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineXferStatus(conn, transferId);
 
   if (PoolTransferTask *task = decodePoolXfer(transferId)) {
     if (!task->fx.isAllDone())
@@ -3276,6 +3329,8 @@ bool flagcxP2pEngineXferStatus(FlagcxP2pConn *conn, uint64_t transferId) {
 int flagcxP2pEngineGetMetadata(FlagcxP2pEngine *engine, char **metadataStr) {
   if (engine == NULL || metadataStr == NULL)
     return -1;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineGetMetadata(engine, metadataStr);
 
   // After bootstrap P2P integration, metadata must expose the bootstrap listen
   // port (used by flagcxP2pEngineConnect for the initial handshake), not the
@@ -3304,6 +3359,8 @@ int flagcxP2pEngineGetMetadata(FlagcxP2pEngine *engine, char **metadataStr) {
 int flagcxP2pEngineGetRpcPort(FlagcxP2pEngine *engine) {
   if (engine == NULL)
     return -1;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineGetRpcPort(engine);
   // Return bootstrap P2P listen port for RPC metadata exchange
   if (engine->bsListenState != NULL && engine->bsListenPort > 0)
     return engine->bsListenPort;
@@ -3320,6 +3377,8 @@ int flagcxP2pEngineGetRpcPort(FlagcxP2pEngine *engine) {
 int flagcxP2pEngineStartRpcServer(FlagcxP2pEngine *engine) {
   if (engine == NULL)
     return -1;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineStartRpcServer(engine);
   bool expected = false;
   if (!engine->rpcServerActive.compare_exchange_strong(expected, true))
     return 0; // already running
@@ -3351,6 +3410,8 @@ FlagcxP2pConn *flagcxP2pEngineGetConn(FlagcxP2pEngine *engine,
                                       const char *session) {
   if (engine == NULL || session == NULL)
     return NULL;
+  if (flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineGetConn(engine, session);
 
   const std::string key(session);
   {
@@ -3391,6 +3452,8 @@ int flagcxP2pEngineMakeDesc(FlagcxP2pConn *conn, uint64_t remoteVa,
                             uint32_t size, FlagcxP2pRdmaDesc *desc) {
   if (conn == NULL || desc == NULL)
     return -1;
+  if (flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineMakeDesc(conn, remoteVa, size, desc);
   for (size_t i = 0; i < conn->remoteRegions.size(); i++) {
     const FlagcxP2pRemoteRegion &r = conn->remoteRegions[i];
     if (remoteVa >= r.baseAddr && remoteVa + size <= r.baseAddr + r.size) {
@@ -3410,6 +3473,8 @@ int flagcxP2pEngineWriteVectorSync(
     const std::vector<FlagcxP2pRdmaDesc> &descs) {
   if (conn == NULL)
     return -1;
+  if (flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineWriteVectorSync(conn, mrIds, srcVec, sizeVec, descs);
   const int numIovs = static_cast<int>(srcVec.size());
   if (numIovs <= 0)
     return 0;
@@ -3586,10 +3651,19 @@ std::vector<FlagcxP2pNotifyMsg> flagcxP2pEngineGetNotifs() {
   return result;
 }
 
+/* Both transports feed the same process-wide list (ACCL's notif thread
+   calls this; declared in flagcx_p2p_accl.h). */
+void flagcxP2pNotifyAppend(const FlagcxP2pNotifyMsg &msg) {
+  std::lock_guard<std::mutex> lock(gNotifyMutex);
+  gNotifyList.push_back(msg);
+}
+
 int flagcxP2pEngineSendNotif(FlagcxP2pConn *conn,
                              FlagcxP2pNotifyMsg *notifyMsg) {
   if (conn == NULL || notifyMsg == NULL)
     return -1;
+  if (flagcxP2pIsAccl(conn))
+    return flagcxAcclEngineSendNotif(conn, notifyMsg);
 
   if (conn->sameProcess) {
     std::lock_guard<std::mutex> lock(gNotifyMutex);
@@ -3614,6 +3688,8 @@ int flagcxP2pEngineSendNotif(FlagcxP2pConn *conn,
 
 int flagcxP2pEngineGetIpcInfo(FlagcxP2pEngine *engine, uintptr_t addr,
                               char *ipcBuf, bool *hasIpc) {
+  if (engine != NULL && flagcxP2pIsAccl(engine))
+    return flagcxAcclEngineGetIpcInfo(engine, addr, ipcBuf, hasIpc);
   (void)engine;
   if (ipcBuf == NULL || hasIpc == NULL)
     return -1;
