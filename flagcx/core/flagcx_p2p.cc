@@ -524,7 +524,9 @@ public:
   FlagcxWorkerPool(const FlagcxWorkerPool &) = delete;
   FlagcxWorkerPool &operator=(const FlagcxWorkerPool &) = delete;
 
-  struct ibv_cq *getSharedCq() const { return shared_cq_; }
+  struct ibv_cq *getSharedCq() const {
+    return shared_cq_;
+  }
   int workerCount() const { return numWorkers_; }
   void registerQp(void *sendComm, struct ibv_qp *qp);
   void unregisterQp(struct ibv_qp *qp);
@@ -3572,6 +3574,12 @@ int flagcxP2pRpcBatchWriteSync(void *connPtr, int count, const uint64_t *srcVa,
            (unsigned long long)dstVa[i], (unsigned long long)sizes[i]);
       return -1;
     }
+  }
+
+  if (flagcxP2pIsAccl(conn)) {
+    std::vector<FlagcxP2pMr> unusedMrIds(count, 0);
+    return flagcxP2pEngineWriteVectorSync(conn, unusedMrIds, srcVec, sizeVec,
+                                          descs);
   }
 
   if (conn->isLocal && conn->sameProcess) {
