@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 BAAI. All rights reserved.
 """Adapt a dashboard template so it works against the PTD stack.
 
 Upstream dashboards (vllm, sglang) are written for whatever datasource the author

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 BAAI. All rights reserved.
+
 # PTD(Prefill-Transfer-Decode Profiler Tool)
 
 1. Request throughput for the "Prefill" phase: Observe the number of requests completed by the system every 5 seconds (accounting for the impact of batching).

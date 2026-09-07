@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 BAAI. All rights reserved.
 """Convert captured metrics snapshots into an OpenMetrics file promtool can load.
 
 Each snapshot in the log starts with a header line written by the capture loop:

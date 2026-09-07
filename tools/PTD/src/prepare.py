@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 BAAI. All rights reserved.
 """Prepare replay data and Grafana provisioning under build/."""
 
 import json
