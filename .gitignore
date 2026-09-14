@@ -11,6 +11,8 @@ plugin/*/*/*.so
 adaptor_plugin/*/*/*.so
 __pycache__/
 **/__pycache__/
+plugin/torch/flagcx/lib/
+plugin/torch/dist/
 
 # Ignore egg-info directories
 *.egg-info/

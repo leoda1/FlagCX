@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 
 # Disable auto load flagcx when setup
@@ -46,6 +47,19 @@ library_dirs = [
 
 libs = ["flagcx"]
 
+# Bundle libflagcx.so into the wheel under flagcx/lib/ so the extension can
+# resolve it at runtime via the $ORIGIN/lib rpath, independent of the build tree.
+flagcx_lib_src = os.path.join(repo_root, "build", "lib", "libflagcx.so")
+bundled_lib_dir = os.path.join(plugin_dir, "flagcx", "lib")
+os.makedirs(bundled_lib_dir, exist_ok=True)
+if os.path.isfile(flagcx_lib_src):
+    shutil.copy2(flagcx_lib_src, os.path.join(bundled_lib_dir, "libflagcx.so"))
+else:
+    print(
+        f"Warning: {flagcx_lib_src} not found; "
+        "the wheel will not bundle libflagcx.so"
+    )
+
 # Add device-specific paths
 dev_includes, dev_libdirs, dev_libs = get_device_config(
     adaptor_flag, torch_backend
@@ -65,7 +79,7 @@ if CppExtension is not None:
         extra_compile_args={
             'cxx': [adaptor_flag, torch_flag] + torch_backend_flags
         },
-        extra_link_args=["-Wl,-rpath," + os.path.join(repo_root, "build", "lib")]
+        extra_link_args=["-Wl,-rpath,$ORIGIN/lib"]
                         + [
                             "-Wl,-rpath," + d
                             for d in get_device_rpath_dirs(
@@ -94,5 +108,6 @@ setup(
         "plugin": os.path.join(repo_root, "plugin"),
         "plugin.interservice": os.path.join(repo_root, "plugin", "interservice"),
     },
+    package_data={"flagcx": ["lib/*.so"]},
     entry_points={"torch.backends": ["flagcx = flagcx:init"]},
 )
