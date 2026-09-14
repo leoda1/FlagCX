@@ -437,7 +437,6 @@ extern int64_t flagcxParamIbTc(void);
 extern int64_t flagcxParamIbArThreshold(void);
 extern int64_t flagcxParamIbPciRelaxedOrdering(void);
 extern int64_t flagcxParamIbAdaptiveRouting(void);
-extern int64_t flagcxParamIbDisable(void);
 extern int64_t flagcxParamIbMergeVfs(void);
 extern int64_t flagcxParamIbMergeNics(void);
 extern int64_t flagcxParamIbQpsPerConn(void);

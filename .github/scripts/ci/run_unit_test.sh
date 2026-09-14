@@ -47,7 +47,7 @@ flagcx_ci_require_rdma() {
 
   platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
   case "$platform_name" in
-    cuda|metax|hygon) ;;
+    cuda|metax|hygon|ppu) ;;
     *) return 0 ;;
   esac
 

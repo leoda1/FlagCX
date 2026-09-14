@@ -7,7 +7,8 @@
  *
  * Shape mirrors Mooncake's barex_transport: one XSimpleMempool over the
  * selected NICs (RegUserMr returns one MR/rkey per NIC); one server +
- * client XContext per NIC; XListener/XConnector own setup (no QP here);
+ * client XContext on the NIC closest to the local GPU; XListener/XConnector
+ * own setup (no QP here);
  * transfers post via XChannel::WriteBatch/ReadBatch with callback
  * completion (no CQ poll); the per-slice remote key comes from the
  * region's per-NIC rkey vector via channel->GetPeerNicId().
@@ -25,6 +26,7 @@
 #include "adaptor.h"
 #include "bootstrap.h"
 #include "debug.h"
+#include "p2p_topo.h"
 #include "param.h"
 #include "socket.h"
 
@@ -123,6 +125,29 @@ struct AcclXfer {
   std::atomic<int> failed{0};
 };
 
+enum AcclConnLifecycle : int {
+  ACCL_CONN_ACTIVE = 0,
+  ACCL_CONN_FAILED = 1,
+  ACCL_CONN_CLOSING = 2,
+  ACCL_CONN_CLOSED = 3,
+};
+
+struct AcclConnState {
+  std::atomic<int> lifecycle{ACCL_CONN_ACTIVE};
+  std::atomic<int> firstError{0};
+
+  void fail(int result) {
+    if (result == 0)
+      result = -1;
+    int expectedError = 0;
+    firstError.compare_exchange_strong(expectedError, result,
+                                       std::memory_order_acq_rel);
+    int expectedState = ACCL_CONN_ACTIVE;
+    lifecycle.compare_exchange_strong(expectedState, ACCL_CONN_FAILED,
+                                      std::memory_order_acq_rel);
+  }
+};
+
 struct NotifPeerFd {
   int fd;
   std::vector<char> inBuf;
@@ -136,6 +161,8 @@ struct FlagcxAcclEngine {
   uint32_t kind = FLAGCX_P2P_KIND_ACCL;
   int localGpuIdx = 0;
   int nDevs = 0;
+  int selectedNetDev = -1;
+  struct flagcxP2pTopoManager *topoMgr = nullptr;
 
   std::vector<XDevice *> devs;
   XSimpleMempool *mempool = nullptr;
@@ -186,6 +213,7 @@ struct FlagcxAcclConn {
   int remoteNotifPort = 0;
   bool isLocal = false;
   bool sameProcess = false;
+  std::shared_ptr<AcclConnState> state = std::make_shared<AcclConnState>();
 
   union flagcxSocketAddress peerAddr; /* host part; for notif connect */
   struct flagcxSocket notifSock;
@@ -217,6 +245,10 @@ inline FlagcxP2pConn *COut(FlagcxAcclConn *c) {
 const char *bxstr(BarexResult r) {
   auto it = BarexResultStrings.find(r);
   return it == BarexResultStrings.end() ? "UNKNOWN" : it->second;
+}
+
+bool barexRetryable(BarexResult result) {
+  return result == BAREX_ERR_QUEUE_FULL || result == BAREX_ERR_RATE_LIMITED;
 }
 
 uint16_t addrPort(const union flagcxSocketAddress *addr) {
@@ -463,6 +495,9 @@ uint32_t regionKeyForNic(const AcclRemoteRegion &r, int nic) {
 }
 
 XChannel *pickChannel(FlagcxAcclConn *conn) {
+  if (conn->state->lifecycle.load(std::memory_order_acquire) !=
+      ACCL_CONN_ACTIVE)
+    return nullptr;
   const size_t n = conn->channels.size();
   if (n == 0)
     return nullptr;
@@ -481,6 +516,12 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
                const std::vector<FlagcxP2pRdmaDesc> &descs, int numIovs,
                bool isRead, uint64_t *transferId) {
   FlagcxAcclEngine *engine = conn->engine;
+  if (conn->state->lifecycle.load(std::memory_order_acquire) !=
+      ACCL_CONN_ACTIVE) {
+    const int firstError =
+        conn->state->firstError.load(std::memory_order_acquire);
+    return firstError != 0 ? firstError : -1;
+  }
   if (!conn->initiator) {
     WARN("NET/ACCL_P2P : v1 supports initiator-side transfers only");
     return -1;
@@ -488,6 +529,7 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
   XChannel *ch = pickChannel(conn);
   if (ch == nullptr) {
     WARN("NET/ACCL_P2P : no active channel");
+    conn->state->fail(-1);
     return -1;
   }
   const int localNic = ch->GetContext()->GetXDevice()->GetId();
@@ -563,10 +605,13 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
     engine->xfers[id] = xfer;
   }
 
-  DoneCallback done = [xfer, batch](Status s) {
+  std::shared_ptr<AcclConnState> connState = conn->state;
+  DoneCallback done = [connState, xfer, batch](Status s) {
     if (!s.IsOk()) {
       WARN("NET/ACCL_P2P : batch failed: %s", s.ErrMsg().c_str());
       xfer->failed.fetch_add(1, std::memory_order_release);
+      if (!barexRetryable(s.ErrCode()))
+        connState->fail(-1);
     }
     xfer->pending.fetch_sub(1, std::memory_order_release);
   };
@@ -578,6 +623,8 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
          isRead ? "ReadBatch" : "WriteBatch", bxstr(r));
     std::lock_guard<std::mutex> lk(engine->xferMu);
     engine->xfers.erase(id);
+    if (!barexRetryable(r))
+      conn->state->fail(-1);
     return -1;
   }
   *transferId = id;
@@ -699,6 +746,11 @@ int connectNotif(FlagcxAcclConn *conn) {
 } // namespace
 
 FlagcxP2pEngine *flagcxAcclEngineCreate() {
+  if (flagcxParamIbDisable()) {
+    INFO(FLAGCX_INIT, "NET/ACCL_P2P : disabled by FLAGCX_IB_DISABLE");
+    return nullptr;
+  }
+
   /* ACCL orders devices by ACCL_USE_NICS; seed it from FLAGCX_IB_HCA so
      both peers see identical NIC indexing (rkey vectors align). */
   const char *hca = flagcxGetEnv("FLAGCX_IB_HCA");
@@ -738,33 +790,67 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
     INFO(FLAGCX_INIT, "NET/ACCL_P2P : dev id=%d name=%s", d->GetId(),
          d->GetName().c_str());
 
+  struct flagcxNetAdaptor *netAdaptor = getNetAdaptor(RDMA);
+  if (netAdaptor == nullptr ||
+      flagcxP2pTopoInit(netAdaptor, &engine->topoMgr) != flagcxSuccess ||
+      flagcxP2pTopoGetNetDev(engine->topoMgr, engine->localGpuIdx,
+                             &engine->selectedNetDev) != flagcxSuccess ||
+      engine->selectedNetDev < 0 || engine->selectedNetDev >= engine->nDevs) {
+    WARN("NET/ACCL_P2P : failed to select a NIC for GPU %d",
+         engine->localGpuIdx);
+    flagcxAcclEngineDestroy(EOut(engine));
+    return nullptr;
+  }
+  INFO(FLAGCX_INIT, "NET/ACCL_P2P : selected GPU %d -> netDev %d (%s)",
+       engine->localGpuIdx, engine->selectedNetDev,
+       engine->devs[engine->selectedNetDev]->GetName().c_str());
+
   BarexResult r = XSimpleMempool::NewInstance(engine->mempool,
                                               "flagcx-p2p-accl", engine->devs);
   if (r != BAREX_SUCCESS) {
     WARN("NET/ACCL_P2P : mempool: %s", bxstr(r));
-    delete engine;
+    flagcxAcclEngineDestroy(EOut(engine));
     return nullptr;
   }
-  XThreadpool::NewInstance(engine->tpServer, 4, "flagcx-accl-server");
-  XThreadpool::NewInstance(engine->tpClient, 4, "flagcx-accl-client");
+  r = XThreadpool::NewInstance(engine->tpServer, 4, "flagcx-accl-server");
+  if (r == BAREX_SUCCESS)
+    r = XThreadpool::NewInstance(engine->tpClient, 4, "flagcx-accl-client");
+  if (r != BAREX_SUCCESS) {
+    WARN("NET/ACCL_P2P : threadpool create failed: %s", bxstr(r));
+    flagcxAcclEngineDestroy(EOut(engine));
+    return nullptr;
+  }
 
   ContextConfig cfg = XConfigUtil::DefaultContextConfig();
-  for (auto *dev : engine->devs) {
-    XContext *sctx = nullptr, *cctx = nullptr;
-    if (XContext::NewInstance(sctx, cfg, new AcclNullCb(), dev, engine->mempool,
-                              engine->tpServer) != BAREX_SUCCESS ||
-        XContext::NewInstance(cctx, cfg, new AcclNullCb(), dev, engine->mempool,
-                              engine->tpClient) != BAREX_SUCCESS) {
-      WARN("NET/ACCL_P2P : XContext create failed on %s",
-           dev->GetName().c_str());
-      flagcxAcclEngineDestroy(EOut(engine));
-      return nullptr;
+  XDevice *selectedDev = engine->devs[engine->selectedNetDev];
+  XContext *sctx = nullptr, *cctx = nullptr;
+  BarexResult contextResult =
+      XContext::NewInstance(sctx, cfg, new AcclNullCb(), selectedDev,
+                            engine->mempool, engine->tpServer);
+  if (contextResult == BAREX_SUCCESS)
+    contextResult =
+        XContext::NewInstance(cctx, cfg, new AcclNullCb(), selectedDev,
+                              engine->mempool, engine->tpClient);
+  if (contextResult != BAREX_SUCCESS) {
+    WARN("NET/ACCL_P2P : XContext create failed on %s",
+         selectedDev->GetName().c_str());
+    if (sctx != nullptr) {
+      sctx->Shutdown();
+      sctx->WaitStop();
+      delete sctx;
     }
-    sctx->Start();
-    cctx->Start();
-    engine->serverCtxs.push_back(sctx);
-    engine->clientCtxs.push_back(cctx);
+    if (cctx != nullptr) {
+      cctx->Shutdown();
+      cctx->WaitStop();
+      delete cctx;
+    }
+    flagcxAcclEngineDestroy(EOut(engine));
+    return nullptr;
   }
+  sctx->Start();
+  cctx->Start();
+  engine->serverCtxs.push_back(sctx);
+  engine->clientCtxs.push_back(cctx);
 
   /* barex data-plane listener: probe for a free port */
   const int base = 18000 + (int)(getpid() % 4096);
@@ -883,29 +969,8 @@ void flagcxAcclEngineDestroy(FlagcxP2pEngine *e) {
     engine->bsListenState = nullptr;
   }
 
-  {
-    std::lock_guard<std::mutex> lk(engine->mrMu);
-    for (auto &kv : engine->mrByBase) {
-      engine->mempool->DeregUserMr(reinterpret_cast<void *>(kv.second.baseAddr),
-                                   kv.second.dtype);
-    }
-    engine->mrByBase.clear();
-  }
-
-  /* teardown order per vendor contract: contexts, connector/listener,
-     threadpools, mempool last */
-  for (auto *ctx : engine->serverCtxs) {
-    ctx->Shutdown();
-    ctx->WaitStop();
-    delete ctx;
-  }
-  for (auto *ctx : engine->clientCtxs) {
-    ctx->Shutdown();
-    ctx->WaitStop();
-    delete ctx;
-  }
-  engine->serverCtxs.clear();
-  engine->clientCtxs.clear();
+  /* Stop channel owners before their contexts.  This drains CloseChannel and
+     completion callbacks while the XContext/XDevice objects are still alive. */
   if (engine->connector != nullptr) {
     engine->connector->Shutdown();
     engine->connector->WaitStop();
@@ -916,6 +981,38 @@ void flagcxAcclEngineDestroy(FlagcxP2pEngine *e) {
     engine->listener->WaitStop();
     delete engine->listener;
   }
+
+  /* Listener shutdown does not close channels already accepted by its server
+     contexts.  Stop both context sets as well, which closes those channels
+     and drains their completion callbacks.  Keep the context objects alive
+     until DeregUserMr has finished. */
+  for (auto *ctx : engine->serverCtxs) {
+    ctx->Shutdown();
+    ctx->WaitStop();
+  }
+  for (auto *ctx : engine->clientCtxs) {
+    ctx->Shutdown();
+    ctx->WaitStop();
+  }
+
+  if (engine->mempool != nullptr) {
+    std::lock_guard<std::mutex> lk(engine->mrMu);
+    for (auto &kv : engine->mrByBase) {
+      engine->mempool->DeregUserMr(reinterpret_cast<void *>(kv.second.baseAddr),
+                                   kv.second.dtype);
+    }
+    engine->mrByBase.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk(engine->xferMu);
+    engine->xfers.clear();
+  }
+  for (auto *ctx : engine->serverCtxs)
+    delete ctx;
+  for (auto *ctx : engine->clientCtxs)
+    delete ctx;
+  engine->serverCtxs.clear();
+  engine->clientCtxs.clear();
   if (engine->tpServer != nullptr) {
     engine->tpServer->Shutdown();
     engine->tpServer->WaitStop();
@@ -931,6 +1028,8 @@ void flagcxAcclEngineDestroy(FlagcxP2pEngine *e) {
     engine->mempool->WaitStop();
     delete engine->mempool;
   }
+  flagcxP2pTopoDestroy(engine->topoMgr);
+  engine->topoMgr = nullptr;
   delete engine;
 }
 
@@ -1068,12 +1167,21 @@ void flagcxAcclEngineConnDestroy(FlagcxP2pConn *c) {
   FlagcxAcclConn *conn = C(c);
   if (conn == nullptr)
     return;
+  conn->state->lifecycle.store(ACCL_CONN_CLOSING, std::memory_order_release);
   FlagcxAcclEngine *engine = conn->engine;
   if (engine != nullptr && engine->connector != nullptr) {
     for (auto *ch : conn->channels) {
       if (ch == nullptr)
         continue;
-      engine->connector->CloseChannel(ch, [ch](Status) { ch->Destroy(); });
+      BarexResult result =
+          engine->connector->CloseChannel(ch, [ch](Status status) {
+            if (!status.IsOk())
+              WARN("NET/ACCL_P2P : CloseChannel failed: %s",
+                   status.ErrMsg().c_str());
+            ch->Destroy();
+          });
+      if (result != BAREX_SUCCESS)
+        WARN("NET/ACCL_P2P : CloseChannel sync error: %s", bxstr(result));
     }
   }
   conn->channels.clear();
@@ -1081,6 +1189,7 @@ void flagcxAcclEngineConnDestroy(FlagcxP2pConn *c) {
     flagcxSocketClose(&conn->notifSock);
     conn->notifConnected = false;
   }
+  conn->state->lifecycle.store(ACCL_CONN_CLOSED, std::memory_order_release);
   delete conn;
 }
 

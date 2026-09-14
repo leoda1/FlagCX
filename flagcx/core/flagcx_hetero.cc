@@ -391,18 +391,18 @@ static bool flagcxRmaProxyPollNonPersistDesc(struct flagcxRmaProxyState *proxy,
 
     // Poll readySeq: wait for GPU stream to signal source data is committed.
     // Both STREAM_OPS (streamWriteValue64) and HOST_FUNC (callback) write here.
+    uint64_t readySeq = UINT64_MAX;
     if (proxy->readySeqsCpu != NULL) {
-      uint64_t ready =
-          __atomic_load_n(&proxy->readySeqsCpu[peer], __ATOMIC_ACQUIRE);
-      if (ready < desc->opSeq) {
+      readySeq = __atomic_load_n(&proxy->readySeqsCpu[peer], __ATOMIC_ACQUIRE);
+      if (readySeq < desc->opSeq) {
         // GPU hasn't signaled ready yet; skip this peer for now
         break;
       }
     }
 
+    // Batch submission is an adaptor capability, not an IB-specific property.
+    // This also lets BAREX use its native WriteBatch implementation.
     bool canBatch = desc->type == FLAGCX_RMA_PUT && comm->netAdaptor != NULL &&
-                    comm->netAdaptor->name != NULL &&
-                    strcmp(comm->netAdaptor->name, "IB") == 0 &&
                     comm->netAdaptor->iputBatch != NULL;
     if (canBatch) {
       int64_t paramBatchMax = flagcxParamRmaBatchMax();
@@ -425,6 +425,11 @@ static bool flagcxRmaProxyPollNonPersistDesc(struct flagcxRmaProxyState *proxy,
         uint32_t curIdx = (ci + (uint32_t)batchCount) & proxy->queueMask;
         struct flagcxRmaDesc *cur =
             proxy->circularBuffers[(size_t)peer * proxy->queueSize + curIdx];
+        // Each stream-ordered descriptor publishes readiness independently.
+        // Do not let a ready head pull a later, not-yet-produced source buffer
+        // into the same native adaptor batch.
+        if (cur->opSeq > readySeq)
+          break;
         if (cur->type != FLAGCX_RMA_PUT || cur->srcMrIdx != desc->srcMrIdx ||
             cur->dstMrIdx != desc->dstMrIdx) {
           break;

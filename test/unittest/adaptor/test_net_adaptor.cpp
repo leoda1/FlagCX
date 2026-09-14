@@ -205,6 +205,11 @@ protected:
   void SetUp() override {
     net_ = getNetAdaptor(RDMA);
     ASSERT_NE(net_, nullptr);
+    const char *expected = getenv("FLAGCX_CI_EXPECT_NET_ADAPTOR");
+    if (expected != nullptr && expected[0] != '\0') {
+      ASSERT_NE(net_->name, nullptr);
+      ASSERT_STREQ(net_->name, expected);
+    }
     SKIP_IF_CALLBACK_NULL(net_, init);
     SKIP_IF_CALLBACK_NULL(net_, devices);
     SKIP_IF_CALLBACK_NULL(net_, listen);
@@ -301,15 +306,25 @@ TEST(NetAdaptorInterface, RdmaAdaptorAdvertisesOneSidedContract) {
   EXPECT_NE(net->name, nullptr);
   EXPECT_NE(net->regMr, nullptr);
   EXPECT_NE(net->deregMr, nullptr);
-  if (net->name == nullptr || strcmp(net->name, "IB") != 0)
-    GTEST_SKIP() << "The build-selected RDMA adaptor is not IBRC";
+  const char *expected = getenv("FLAGCX_CI_EXPECT_NET_ADAPTOR");
+  if (expected != nullptr && expected[0] != '\0') {
+    ASSERT_STREQ(net->name, expected);
+  }
+  if (net->name == nullptr ||
+      (strcmp(net->name, "IB") != 0 && strcmp(net->name, "BAREX") != 0))
+    GTEST_SKIP() << "The build-selected adaptor has no one-sided contract";
   EXPECT_NE(net->getMrInfo, nullptr);
   EXPECT_NE(net->iput, nullptr);
   EXPECT_NE(net->iget, nullptr);
-  EXPECT_NE(net->iputSignal, nullptr);
   EXPECT_NE(net->iputBatch, nullptr);
   EXPECT_NE(net->testBatch, nullptr);
   EXPECT_NE(net->igetBatch, nullptr);
+  if (strcmp(net->name, "IB") == 0) {
+    EXPECT_NE(net->iputSignal, nullptr);
+  } else {
+    EXPECT_EQ(net->iputSignal, nullptr);
+    EXPECT_EQ(net->regMrDmaBuf, nullptr);
+  }
 }
 
 TEST_F(IbMrCleanupTest, FailedDeregisterRetainsOnlyUnconsumedNicHandles) {
@@ -523,6 +538,49 @@ TEST_F(NetAdaptorLoopback, RegisterHostMrAndExportMetadata) {
   }
   EXPECT_DEREGISTER_MR(sendComm_, mr);
   EXPECT_EQ(net_->deregMr(sendComm_, nullptr), flagcxSuccess);
+}
+
+TEST_F(NetAdaptorLoopback, InteriorHostMrReusesRegistration) {
+  SKIP_IF_CALLBACK_NULL(net_, regMr);
+  SKIP_IF_CALLBACK_NULL(net_, deregMr);
+  SKIP_IF_CALLBACK_NULL(net_, getMrInfo);
+  if (net_->name == nullptr || strcmp(net_->name, "BAREX") != 0)
+    GTEST_SKIP() << "Interior MR reuse is a BAREX registry contract";
+  std::vector<uint8_t> buffer(kBufferSize);
+  const size_t registeredSize = buffer.size() - 512;
+  void *wholeMr = nullptr;
+  void *interiorMr = nullptr;
+  ASSERT_REGISTER_MR(sendComm_, buffer.data(), registeredSize, FLAGCX_PTR_HOST,
+                     wholeMr);
+  ASSERT_EQ(registerMr(sendComm_, buffer.data() + 128, registeredSize - 256,
+                       FLAGCX_PTR_HOST, &interiorMr),
+            flagcxSuccess);
+  ASSERT_EQ(interiorMr, wholeMr);
+
+  void *overlappingMr = reinterpret_cast<void *>(1);
+  EXPECT_EQ(registerMr(sendComm_, buffer.data() + registeredSize - 128, 256,
+                       FLAGCX_PTR_HOST, &overlappingMr),
+            flagcxInvalidArgument);
+  EXPECT_EQ(overlappingMr, nullptr);
+
+  ASSERT_EQ(net_->deregMr(sendComm_, interiorMr), flagcxSuccess);
+  struct flagcxNetMrInfo info = {};
+  EXPECT_EQ(net_->getMrInfo(wholeMr, &info), flagcxSuccess);
+  EXPECT_GT(info.nKeys, 0u);
+  EXPECT_DEREGISTER_MR(sendComm_, wholeMr);
+}
+
+TEST_F(NetAdaptorLoopback, ListenerAcceptsSequentialConnections) {
+  if (net_->name == nullptr || strcmp(net_->name, "BAREX") != 0)
+    GTEST_SKIP() << "Reusable listener coverage is specific to BAREX";
+  ConnectionResult second =
+      connectLoopback(net_, netDev_, handle_, listenComm_);
+  ASSERT_EQ(second.connectResult, flagcxSuccess);
+  ASSERT_EQ(second.acceptResult, flagcxSuccess);
+  ASSERT_NE(second.sendComm, nullptr);
+  ASSERT_NE(second.recvComm, nullptr);
+  EXPECT_EQ(net_->closeSend(second.sendComm), flagcxSuccess);
+  EXPECT_EQ(net_->closeRecv(second.recvComm), flagcxSuccess);
 }
 
 TEST_F(NetAdaptorLoopback, RegisterGpuMr) {
@@ -757,8 +815,29 @@ TEST_F(NetAdaptorLoopback, RequestPoolBackpressureAndRecovery) {
             flagcxInProgress);
   EXPECT_EQ(posted, 0);
   EXPECT_EQ(batchRequests[0], nullptr);
-  for (void *request : pending)
-    ASSERT_EQ(waitRequest(net_, request), flagcxSuccess);
+  ASSERT_EQ(waitRequest(net_, pending[0]), flagcxSuccess);
+  pending[0] = nullptr;
+
+  if (net_->name != nullptr && strcmp(net_->name, "BAREX") == 0) {
+    const uint64_t partialOffsets[2] = {0, 0};
+    const size_t partialSizes[2] = {1, 1};
+    void *partialRequests[2] = {};
+    posted = -1;
+    EXPECT_EQ(net_->iputBatch(sendComm_, 2, partialOffsets, partialOffsets,
+                              partialSizes, kLocalRank, kRemoteRank,
+                              sourceWindow.opaque(), remoteWindow.opaque(),
+                              partialRequests, &posted),
+              flagcxInProgress);
+    EXPECT_EQ(posted, 1);
+    ASSERT_NE(partialRequests[0], nullptr);
+    EXPECT_EQ(partialRequests[1], nullptr);
+    ASSERT_EQ(waitRequest(net_, partialRequests[0]), flagcxSuccess);
+  }
+  for (void *request : pending) {
+    if (request != nullptr) {
+      ASSERT_EQ(waitRequest(net_, request), flagcxSuccess);
+    }
+  }
 
   void *request = nullptr;
   ASSERT_EQ(net_->iput(sendComm_, 0, 0, 1, kLocalRank, kRemoteRank,
