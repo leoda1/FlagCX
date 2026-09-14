@@ -1696,29 +1696,31 @@ struct flagcxNetAdaptor flagcxNetBarex = {
 /* Keep the external plugin ABI at v1. The complete one-sided and batch
    interface above is available through the build-selected flagcxNetBarex
    adaptor; v1 cannot describe getMrInfo or the batch callbacks. */
-extern "C" __attribute__((visibility(
-    "default"))) struct flagcxNetAdaptor_v1 flagcxNetAdaptorPlugin_v1 = {
-    "BAREX",
-    barexnet::barexInit,
-    barexnet::barexDevices,
-    barexnet::barexGetProperties,
-    barexnet::barexListen,
-    barexnet::barexConnect,
-    barexnet::barexAccept,
-    barexnet::barexCloseSend,
-    barexnet::barexCloseRecv,
-    barexnet::barexCloseListen,
-    barexnet::barexRegMr,
-    NULL,
-    barexnet::barexDeregMr,
-    barexnet::barexIsend,
-    barexnet::barexIrecv,
-    barexnet::barexIflush,
-    barexnet::barexTest,
-    NULL, // iput
-    NULL, // iget
-    NULL, // iputSignal
-    barexnet::barexGetDevFromName,
+extern "C" {
+struct flagcxNetAdaptor_v1 flagcxNetAdaptorPlugin_v1
+    __attribute__((visibility("default"))) = {
+        "BAREX",
+        barexnet::barexInit,
+        barexnet::barexDevices,
+        barexnet::barexGetProperties,
+        barexnet::barexListen,
+        barexnet::barexConnect,
+        barexnet::barexAccept,
+        barexnet::barexCloseSend,
+        barexnet::barexCloseRecv,
+        barexnet::barexCloseListen,
+        barexnet::barexRegMr,
+        NULL,
+        barexnet::barexDeregMr,
+        barexnet::barexIsend,
+        barexnet::barexIrecv,
+        barexnet::barexIflush,
+        barexnet::barexTest,
+        NULL, // iput
+        NULL, // iget
+        NULL, // iputSignal
+        barexnet::barexGetDevFromName,
 };
+}
 
 #endif // USE_ACCL_BAREX

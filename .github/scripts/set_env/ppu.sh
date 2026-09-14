@@ -28,7 +28,6 @@ fi
 # PPU uses BAREX ACCL for both P2P and RMA. The RMA suite remains enabled so
 # ACCL one-sided support is exercised as it is completed.
 export FLAGCX_P2P_TRANSPORT=accl
-export FLAGCX_USE_HETERO_COMM=1
 export FLAGCX_MEM_ENABLE=1
 export FLAGCX_VMM_ENABLE=0
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
@@ -69,13 +68,6 @@ flagcx_ci_configure_suite() {
     rma)
       export FLAGCX_P2P_TRANSPORT=accl
       ;;
-    runner)
-      # PCCL on PPU currently hangs in the heterogeneous runner variants.
-      # Keep the regular collective runner coverage enabled.
-      unset FLAGCX_USE_HETERO_COMM FLAGCX_CLUSTER_SPLIT_LIST FLAGCX_MEM_ENABLE FLAGCX_VMM_ENABLE
-      export NCCL_P2P_DISABLE=1
-      export NCCL_SHM_DISABLE=1
-      ;;
   esac
 }
 
@@ -91,9 +83,38 @@ flagcx_ci_run_suite_override() {
       "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}"
     cd "$suite_dir"
     FLAGCX_CI_MPI_LABEL="runner default" \
+      env -u FLAGCX_USE_HOST_COMM -u FLAGCX_USE_HETERO_COMM \
+      -u FLAGCX_CLUSTER_SPLIT_LIST -u FLAGCX_MEM_ENABLE \
+      -u FLAGCX_VMM_ENABLE -u FLAGCX_P2P_TRANSPORT \
+      -u FLAGCX_P2P_DISABLE \
       "$MPI_RUNNER" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
       ./build/bin/runner_mpi_tests
-    echo "Skipping PPU runner heterogeneous MPI variants: PCCL ACCL backend currently hangs in FLAGCX_CLUSTER_SPLIT_LIST mode."
+    FLAGCX_CI_MPI_LABEL="runner BAREX heterogeneous SendRecv smoke" \
+      "$MPI_RUNNER" -np 2 --allow-run-as-root \
+      -x FLAGCX_USE_HETERO_COMM=1 \
+      -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+      -x FLAGCX_MEM_ENABLE=1 \
+      -x FLAGCX_VMM_ENABLE=0 \
+      -x FLAGCX_P2P_TRANSPORT=accl \
+      ./build/bin/runner_mpi_tests \
+      --gtest_filter=FlagCXCollTest.SendRecv
+    FLAGCX_CI_MPI_LABEL="runner BAREX heterogeneous" \
+      env -u FLAGCX_USE_HOST_COMM -u FLAGCX_USE_HETERO_COMM \
+      "$MPI_RUNNER" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+      -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+      -x FLAGCX_MEM_ENABLE=1 \
+      -x FLAGCX_VMM_ENABLE=0 \
+      -x FLAGCX_P2P_TRANSPORT=accl \
+      ./build/bin/runner_mpi_tests
+    FLAGCX_CI_MPI_LABEL="runner BAREX forced NET" \
+      env -u FLAGCX_USE_HOST_COMM -u FLAGCX_USE_HETERO_COMM \
+      "$MPI_RUNNER" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+      -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+      -x FLAGCX_MEM_ENABLE=1 \
+      -x FLAGCX_VMM_ENABLE=0 \
+      -x FLAGCX_P2P_TRANSPORT=accl \
+      -x FLAGCX_P2P_DISABLE=1 \
+      ./build/bin/runner_mpi_tests
     return
   fi
 
@@ -112,8 +133,7 @@ flagcx_ci_prepare() {
   rm -rf "$project_root/build" \
     "$project_root/third-party/googletest/build"
 
-  # BAREX exposes libu2mm symbols globally. PCCL uses the same names for
-  # function-pointer objects, so deep-bind PCCL to prevent a startup crash.
+  # Deep-bind the vendor collective library to avoid symbol interposition.
   mkdir -p "$FLAGCX_CI_PPU_DLOPEN_SHIM_DIR"
   "${CC:-cc}" -shared -fPIC -O2 -Wall -Wextra \
     "$FLAGCX_CI_PPU_DLOPEN_SHIM_SOURCE" \
@@ -122,7 +142,7 @@ flagcx_ci_prepare() {
     *":$FLAGCX_CI_PPU_DLOPEN_SHIM:"*) ;;
     *) export LD_PRELOAD="$FLAGCX_CI_PPU_DLOPEN_SHIM${LD_PRELOAD:+:$LD_PRELOAD}" ;;
   esac
-  echo "PCCL deep-bind shim: $FLAGCX_CI_PPU_DLOPEN_SHIM"
+  echo "PPU deep-bind shim: $FLAGCX_CI_PPU_DLOPEN_SHIM"
   command -v mpirun
   mpirun --version
 

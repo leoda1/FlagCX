@@ -69,6 +69,16 @@ using PerfRootDataInitFn = void (*)(PerfContext &ctx, size_t size, size_t count,
 using PerfRootPostIterFn = void (*)(PerfContext &ctx, size_t size, size_t count,
                                     int root);
 
+// Turn every FlagCX failure into a non-zero MPI job result. Perf binaries are
+// CI correctness gates as well as benchmarks, so silently ignoring an adaptor
+// or collective error would create a false pass.
+[[noreturn]] void perfAbort(const char *message, const char *file, int line);
+void perfCheck(flagcxResult_t result, const char *expression, const char *file,
+               int line);
+
+#define PERF_CHECK(expression)                                                 \
+  perfCheck((expression), #expression, __FILE__, __LINE__)
+
 // Initialize everything: parse args, MPI init, GPU setup, comm init,
 // buffer allocation. bufSizeFn is called after MPI init (when totalProcs
 // is known) to determine send/recv buffer sizes; nullptr = both maxBytes.

@@ -8,6 +8,7 @@ from unittest import mock
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+BUILD_CONFIG_SOURCE = (PLUGIN_DIR / "_build_config.py").read_text()
 sys.path.insert(0, str(PLUGIN_DIR))
 
 import _build_config as build_config
@@ -148,6 +149,28 @@ class TorchBackendConfigTest(unittest.TestCase):
         self.assertEqual(
             build_config.get_device_rpath_dirs("unused", paths), paths
         )
+
+    def test_ppu_has_independent_cuda_compatible_torch_runtime(self):
+        with self.clean_environment():
+            backend = build_config.resolve_torch_backend("ppu")
+            config = build_config.get_device_config(
+                build_config.ADAPTOR_MAP["ppu"], backend
+            )
+
+        self.assertEqual(backend.name, "vendor")
+        self.assertEqual(backend.device_name, "")
+        self.assertEqual(
+            config,
+            (
+                ["/usr/local/cuda/include"],
+                ["/usr/local/cuda/lib64"],
+                ["cuda", "cudart", "c10_cuda", "torch_cuda"],
+            ),
+        )
+        self.assertIn(
+            'elif adaptor_flag == "-DUSE_PPU_ADAPTOR":', BUILD_CONFIG_SOURCE
+        )
+        self.assertEqual(build_config.ADAPTOR_TO_MAKE_FLAG["ppu"], "USE_PPU")
 
 
 if __name__ == "__main__":

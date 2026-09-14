@@ -1,6 +1,30 @@
 #include "perf_common.h"
 #include <cstdio>
 
+[[noreturn]] void perfAbort(const char *message, const char *file, int line) {
+  fprintf(stderr, "Perf test failure at %s:%d: %s\n", file, line, message);
+  fflush(stderr);
+
+  int mpiInitialized = 0;
+  MPI_Initialized(&mpiInitialized);
+  if (mpiInitialized) {
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  abort();
+}
+
+void perfCheck(flagcxResult_t result, const char *expression, const char *file,
+               int line) {
+  if (result == flagcxSuccess) {
+    return;
+  }
+
+  char message[1024];
+  snprintf(message, sizeof(message), "%s returned %d (%s)", expression,
+           static_cast<int>(result), flagcxGetErrorString(result));
+  perfAbort(message, file, line);
+}
+
 void perfSetup(PerfContext &ctx, int argc, char **argv,
                PerfBufSizeFn bufSizeFn) {
   // Parse arguments
@@ -25,7 +49,7 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
   ctx.op = (flagcxRedOp_t)(parsedOp >= 0 ? parsedOp : flagcxSum);
 
   // Initialize FlagCX device handle
-  flagcxDeviceHandleInit(&ctx.devHandle);
+  PERF_CHECK(flagcxDeviceHandleInit(&ctx.devHandle));
 
   // Initialize MPI environment
   ctx.color = 0;
@@ -42,22 +66,26 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
 
   // GPU setup
   int nGpu;
-  ctx.devHandle->getDeviceCount(&nGpu);
-  ctx.devHandle->setDevice(ctx.worldRank % nGpu);
+  PERF_CHECK(ctx.devHandle->getDeviceCount(&nGpu));
+  if (nGpu <= 0) {
+    perfAbort("no accelerator devices are visible", __FILE__, __LINE__);
+  }
+  PERF_CHECK(ctx.devHandle->setDevice(ctx.worldRank % nGpu));
 
   // Create and broadcast uniqueId
   flagcxUniqueId uniqueId;
   if (ctx.proc == 0)
-    flagcxGetUniqueId(&uniqueId);
+    PERF_CHECK(flagcxGetUniqueId(&uniqueId));
   MPI_Bcast((void *)&uniqueId, sizeof(flagcxUniqueId), MPI_BYTE, 0,
             ctx.splitComm);
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Initialize communicator
-  flagcxCommInitRank(&ctx.comm, ctx.totalProcs, &uniqueId, ctx.proc);
+  PERF_CHECK(
+      flagcxCommInitRank(&ctx.comm, ctx.totalProcs, &uniqueId, ctx.proc));
 
   // Create stream
-  ctx.devHandle->streamCreate(&ctx.stream);
+  PERF_CHECK(ctx.devHandle->streamCreate(&ctx.stream));
 
   // Buffer sizes: call bufSizeFn if provided (totalProcs is now known)
   size_t sBufSize = ctx.maxBytes;
@@ -74,24 +102,31 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
   ctx.recvHandle = nullptr;
 
   if (ctx.localRegister) {
-    flagcxMemAlloc(&ctx.sendbuff, sBufSize);
-    flagcxMemAlloc(&ctx.recvbuff, rBufSize);
-    flagcxCommRegister(ctx.comm, ctx.sendbuff, sBufSize, &ctx.sendHandle);
-    flagcxCommRegister(ctx.comm, ctx.recvbuff, rBufSize, &ctx.recvHandle);
+    PERF_CHECK(flagcxMemAlloc(&ctx.sendbuff, sBufSize));
+    PERF_CHECK(flagcxMemAlloc(&ctx.recvbuff, rBufSize));
+    PERF_CHECK(
+        flagcxCommRegister(ctx.comm, ctx.sendbuff, sBufSize, &ctx.sendHandle));
+    PERF_CHECK(
+        flagcxCommRegister(ctx.comm, ctx.recvbuff, rBufSize, &ctx.recvHandle));
   } else {
-    ctx.devHandle->deviceMalloc(&ctx.sendbuff, sBufSize, flagcxMemDevice, NULL);
-    ctx.devHandle->deviceMalloc(&ctx.recvbuff, rBufSize, flagcxMemDevice, NULL);
+    PERF_CHECK(ctx.devHandle->deviceMalloc(&ctx.sendbuff, sBufSize,
+                                           flagcxMemDevice, NULL));
+    PERF_CHECK(ctx.devHandle->deviceMalloc(&ctx.recvbuff, rBufSize,
+                                           flagcxMemDevice, NULL));
   }
   ctx.hello = malloc(hBufSize);
+  if (ctx.hello == nullptr) {
+    perfAbort("host buffer allocation failed", __FILE__, __LINE__);
+  }
   memset(ctx.hello, 0, hBufSize);
 
   // Zero-init device buffers to avoid UB in tests without custom dataInitFn
   if (ctx.sendbuff && ctx.recvbuff) {
-    ctx.devHandle->deviceMemset(ctx.sendbuff, 0, sBufSize, flagcxMemDevice,
-                                ctx.stream);
-    ctx.devHandle->deviceMemset(ctx.recvbuff, 0, rBufSize, flagcxMemDevice,
-                                ctx.stream);
-    ctx.devHandle->streamSynchronize(ctx.stream);
+    PERF_CHECK(ctx.devHandle->deviceMemset(ctx.sendbuff, 0, sBufSize,
+                                           flagcxMemDevice, ctx.stream));
+    PERF_CHECK(ctx.devHandle->deviceMemset(ctx.recvbuff, 0, rBufSize,
+                                           flagcxMemDevice, ctx.stream));
+    PERF_CHECK(ctx.devHandle->streamSynchronize(ctx.stream));
   }
 
   ctx.userData = nullptr;
@@ -99,18 +134,18 @@ void perfSetup(PerfContext &ctx, int argc, char **argv,
 
 void perfTeardown(PerfContext &ctx) {
   if (ctx.localRegister) {
-    flagcxCommDeregister(ctx.comm, ctx.sendHandle);
-    flagcxCommDeregister(ctx.comm, ctx.recvHandle);
-    flagcxMemFree(ctx.sendbuff);
-    flagcxMemFree(ctx.recvbuff);
+    PERF_CHECK(flagcxCommDeregister(ctx.comm, ctx.sendHandle));
+    PERF_CHECK(flagcxCommDeregister(ctx.comm, ctx.recvHandle));
+    PERF_CHECK(flagcxMemFree(ctx.sendbuff));
+    PERF_CHECK(flagcxMemFree(ctx.recvbuff));
   } else {
-    ctx.devHandle->deviceFree(ctx.sendbuff, flagcxMemDevice, NULL);
-    ctx.devHandle->deviceFree(ctx.recvbuff, flagcxMemDevice, NULL);
+    PERF_CHECK(ctx.devHandle->deviceFree(ctx.sendbuff, flagcxMemDevice, NULL));
+    PERF_CHECK(ctx.devHandle->deviceFree(ctx.recvbuff, flagcxMemDevice, NULL));
   }
   free(ctx.hello);
-  ctx.devHandle->streamDestroy(ctx.stream);
-  flagcxCommDestroy(ctx.comm);
-  flagcxDeviceHandleFree(ctx.devHandle);
+  PERF_CHECK(ctx.devHandle->streamDestroy(ctx.stream));
+  PERF_CHECK(flagcxCommDestroy(ctx.comm));
+  PERF_CHECK(flagcxDeviceHandleFree(ctx.devHandle));
   delete ctx.args;
 
   MPI_Finalize();
@@ -119,30 +154,28 @@ void perfTeardown(PerfContext &ctx) {
 void perfWarmup(PerfContext &ctx, PerfCollFn fn) {
   size_t typeSize = getFlagcxDataTypeSize(ctx.datatype);
   if (typeSize == 0) {
-    fprintf(stderr, "Error: unknown datatype (size=0)\n");
-    return;
+    perfAbort("unknown datatype (size=0)", __FILE__, __LINE__);
   }
   // Warmup for large size
   size_t largeCount = ctx.maxBytes / typeSize;
   for (int i = 0; i < ctx.numWarmupIters; i++) {
     fn(ctx, largeCount);
   }
-  ctx.devHandle->streamSynchronize(ctx.stream);
+  PERF_CHECK(ctx.devHandle->streamSynchronize(ctx.stream));
 
   // Warmup for small size
   size_t smallCount = ctx.minBytes / typeSize;
   for (int i = 0; i < ctx.numWarmupIters; i++) {
     fn(ctx, smallCount);
   }
-  ctx.devHandle->streamSynchronize(ctx.stream);
+  PERF_CHECK(ctx.devHandle->streamSynchronize(ctx.stream));
 }
 
 void perfBenchmarkLoop(PerfContext &ctx, PerfCollFn collFn,
                        PerfBwFactorFn bwFactorFn, PerfDataInitFn dataInitFn,
                        PerfPostIterFn postIterFn, bool iterateOps) {
   if (ctx.stepFactor <= 1) {
-    fprintf(stderr, "Error: stepFactor must be > 1 (got %d)\n", ctx.stepFactor);
-    return;
+    perfAbort("stepFactor must be greater than 1", __FILE__, __LINE__);
   }
 
   // Determine which types and ops to run
@@ -207,7 +240,7 @@ void perfBenchmarkLoop(PerfContext &ctx, PerfCollFn collFn,
         for (int i = 0; i < ctx.numIters; i++) {
           collFn(ctx, count);
         }
-        ctx.devHandle->streamSynchronize(ctx.stream);
+        PERF_CHECK(ctx.devHandle->streamSynchronize(ctx.stream));
 
         // Compute average elapsed time across all ranks
         double elapsedTime = ctx.tim.elapsed() / ctx.numIters;
@@ -243,8 +276,7 @@ void perfRootBenchmarkLoop(PerfContext &ctx, PerfRootCollFn collFn,
                            PerfRootDataInitFn dataInitFn,
                            PerfRootPostIterFn postIterFn, bool iterateOps) {
   if (ctx.stepFactor <= 1) {
-    fprintf(stderr, "Error: stepFactor must be > 1 (got %d)\n", ctx.stepFactor);
-    return;
+    perfAbort("stepFactor must be greater than 1", __FILE__, __LINE__);
   }
 
   // Determine which types and ops to run
@@ -321,7 +353,7 @@ void perfRootBenchmarkLoop(PerfContext &ctx, PerfRootCollFn collFn,
           for (int i = 0; i < ctx.numIters; i++) {
             collFn(ctx, count, r);
           }
-          ctx.devHandle->streamSynchronize(ctx.stream);
+          PERF_CHECK(ctx.devHandle->streamSynchronize(ctx.stream));
 
           MPI_Barrier(MPI_COMM_WORLD);
 

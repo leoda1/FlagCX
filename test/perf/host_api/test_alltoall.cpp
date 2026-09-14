@@ -1,8 +1,8 @@
 #include "perf_common.h"
 
 static void collFn(PerfContext &ctx, size_t count) {
-  flagcxAlltoAll(ctx.sendbuff, ctx.recvbuff, count / ctx.totalProcs,
-                 ctx.datatype, ctx.comm, ctx.stream);
+  PERF_CHECK(flagcxAlltoAll(ctx.sendbuff, ctx.recvbuff, count / ctx.totalProcs,
+                            ctx.datatype, ctx.comm, ctx.stream));
 }
 
 static double bwFactorFn(int totalProcs) {

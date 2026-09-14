@@ -54,16 +54,16 @@ static void computeCounts(PerfContext &ctx, size_t perPeerCount) {
 static void warmupFn(PerfContext &ctx, size_t count) {
   AlltoallvData *d = (AlltoallvData *)ctx.userData;
   computeCounts(ctx, count / ctx.totalProcs);
-  flagcxAlltoAllv(ctx.sendbuff, d->hSendcounts, d->hSdispls, ctx.recvbuff,
-                  d->hRecvcounts, d->hRdispls, ctx.datatype, ctx.comm,
-                  ctx.stream);
+  PERF_CHECK(flagcxAlltoAllv(ctx.sendbuff, d->hSendcounts, d->hSdispls,
+                             ctx.recvbuff, d->hRecvcounts, d->hRdispls,
+                             ctx.datatype, ctx.comm, ctx.stream));
 }
 
 static void collFn(PerfContext &ctx, size_t count) {
   AlltoallvData *d = (AlltoallvData *)ctx.userData;
-  flagcxAlltoAllv(ctx.sendbuff, d->hSendcounts, d->hSdispls, ctx.recvbuff,
-                  d->hRecvcounts, d->hRdispls, ctx.datatype, ctx.comm,
-                  ctx.stream);
+  PERF_CHECK(flagcxAlltoAllv(ctx.sendbuff, d->hSendcounts, d->hSdispls,
+                             ctx.recvbuff, d->hRecvcounts, d->hRdispls,
+                             ctx.datatype, ctx.comm, ctx.stream));
 }
 
 static double bwFactorFn(int totalProcs) {
@@ -81,16 +81,16 @@ static void dataInitFn(PerfContext &ctx, size_t size, size_t count) {
     memcpy((char *)ctx.hello + offset, &val,
            sizeof(float) < typeSize ? sizeof(float) : typeSize);
   }
-  ctx.devHandle->deviceMemcpy(ctx.sendbuff, ctx.hello, size,
-                              flagcxMemcpyHostToDevice, NULL);
+  PERF_CHECK(ctx.devHandle->deviceMemcpy(ctx.sendbuff, ctx.hello, size,
+                                         flagcxMemcpyHostToDevice, NULL));
 
   computeCounts(ctx, perPeer);
 }
 
 static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
   memset(ctx.hello, 0, size);
-  ctx.devHandle->deviceMemcpy(ctx.hello, ctx.recvbuff, size,
-                              flagcxMemcpyDeviceToHost, NULL);
+  PERF_CHECK(ctx.devHandle->deviceMemcpy(ctx.hello, ctx.recvbuff, size,
+                                         flagcxMemcpyDeviceToHost, NULL));
 }
 
 int main(int argc, char *argv[]) {

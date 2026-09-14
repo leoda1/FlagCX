@@ -1,8 +1,8 @@
 #include "perf_common.h"
 
 static void collFn(PerfContext &ctx, size_t count) {
-  flagcxAllReduce(ctx.sendbuff, ctx.recvbuff, count, ctx.datatype, ctx.op,
-                  ctx.comm, ctx.stream);
+  PERF_CHECK(flagcxAllReduce(ctx.sendbuff, ctx.recvbuff, count, ctx.datatype,
+                             ctx.op, ctx.comm, ctx.stream));
 }
 
 static double bwFactorFn(int totalProcs) {
@@ -25,16 +25,16 @@ static void dataInitFn(PerfContext &ctx, size_t size, size_t count) {
     memcpy((char *)ctx.hello + i * typeSize, &val,
            sizeof(float) < typeSize ? sizeof(float) : typeSize);
   }
-  ctx.devHandle->deviceMemcpy(ctx.sendbuff, ctx.hello, size,
-                              flagcxMemcpyHostToDevice, NULL);
-  ctx.devHandle->deviceMemcpy(ctx.recvbuff, ctx.hello, size,
-                              flagcxMemcpyHostToDevice, NULL);
+  PERF_CHECK(ctx.devHandle->deviceMemcpy(ctx.sendbuff, ctx.hello, size,
+                                         flagcxMemcpyHostToDevice, NULL));
+  PERF_CHECK(ctx.devHandle->deviceMemcpy(ctx.recvbuff, ctx.hello, size,
+                                         flagcxMemcpyHostToDevice, NULL));
 }
 
 static void postIterFn(PerfContext &ctx, size_t size, size_t count) {
   memset(ctx.hello, 0, size);
-  ctx.devHandle->deviceMemcpy(ctx.hello, ctx.recvbuff, size,
-                              flagcxMemcpyDeviceToHost, NULL);
+  PERF_CHECK(ctx.devHandle->deviceMemcpy(ctx.hello, ctx.recvbuff, size,
+                                         flagcxMemcpyDeviceToHost, NULL));
 }
 
 int main(int argc, char *argv[]) {

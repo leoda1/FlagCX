@@ -226,9 +226,9 @@ jobs:
           source /opt/dtk/env.sh
           make -j$(nproc) USE_DU=1 MPI_HOME=/opt/mpi CCL_HOME=/opt/dtk/cuda/cuda-12
 
-      # Hygon currently supports the homogeneous single-node path here.
-      # Heterogeneous, RMA, and device-API paths are covered only where the
-      # backend advertises support; unsupported cases self-skip in the tests.
+      # Hygon currently supports the homogeneous single-node path here and
+      # intentionally skips uniRunner because the DU single-node heterogeneous
+      # simulation stalls.
       - name: Perf tests (Hygon homogeneous 8-chip)
         shell: bash
         run: |
@@ -417,3 +417,59 @@ jobs:
           mpirun -np 8 --allow-run-as-root $PERF_BIN/perf_gather -b 128M -e 1G -f 2 -r 0 -p 1
           mpirun -np 8 --allow-run-as-root $PERF_BIN/perf_scatter -b 128M -e 1G -f 2 -r 0 -p 1
           mpirun -np 8 --allow-run-as-root $PERF_BIN/perf_reduce -b 128M -e 1G -f 2 -r 0 -p 1
+
+      - name: Perf tests (MetaX uniRunner 8-chip)
+        shell: bash
+        run: |
+          cd /__w/FlagCX/FlagCX
+          source .github/scripts/set_env/metax.sh
+          export PATH=/opt/maca/mxgpu_llvm/bin:$MPI_HOME/bin:$PATH
+          export LD_LIBRARY_PATH=/__w/FlagCX/FlagCX/build/lib:/opt/mxdriver/lib:/opt/maca/lib:/usr/local/lib:$MPI_HOME/lib:$LD_LIBRARY_PATH
+          set -e
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_alltoall -b 128M -e 1G -f 2 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_alltoallv -b 128M -e 1G -f 2 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_sendrecv -b 128M -e 1G -f 2 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_allgather -b 128M -e 1G -f 2 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_broadcast -b 128M -e 1G -f 2 -r 0 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_gather -b 128M -e 1G -f 2 -r 0 -p 1
+          mpirun -np 8 --allow-run-as-root -x FLAGCX_MEM_ENABLE=1 -x FLAGCX_USE_HETERO_COMM=1 $PERF_BIN/perf_scatter -b 128M -e 1G -f 2 -r 0 -p 1
+
+  perf-test-ppu:
+    name: perf-test (ppu)
+    runs-on: [flagcicd-810e]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          ssh-strict: true
+          ssh-user: git
+          persist-credentials: true
+          clean: true
+          sparse-checkout-cone-mode: true
+          fetch-tags: false
+          show-progress: true
+          lfs: false
+          submodules: recursive
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run PPU perf tests
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_IMAGE: harbor.baai.ac.cn/flagos-dev/flagcx:manual-20260827-ppu-dev
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_ppu_container.sh" perf
+
+      - name: Cleanup PPU perf container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-perf-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
