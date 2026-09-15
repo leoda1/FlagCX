@@ -16,28 +16,7 @@
   "to": "now"
  },
  "templating": {
-  "list": [
-   {
-    "name": "kv_bytes_per_request",
-    "label": "KV bytes/request (0 = unconfigured)",
-    "type": "textbox",
-    "query": "167772160",
-    "current": {
-     "selected": true,
-     "text": "167772160",
-     "value": "167772160"
-    },
-    "options": [
-     {
-      "selected": true,
-      "text": "167772160",
-      "value": "167772160"
-     }
-    ],
-    "hide": 0,
-    "skipUrlSync": false
-   }
-  ]
+  "list": []
  },
  "panels": [
   {
@@ -617,7 +596,7 @@
    "id": 14,
    "type": "timeseries",
    "title": "KV Cache Equivalent Throughput (req/s)",
-   "description": "Current KV payload bytes/s divided by the configured KV bytes/request, directly comparable with Prefill and Decode req/s. Set KV bytes/request at the top; when it is 0 this panel intentionally returns no data.",
+   "description": "真实 req/s（随负载自适应）：分母不再是顶部输入框的固定 KV bytes/request，而是所选时间段内实测的每请求 KV 大小＝ KV Cache 累计传输字节增量 ÷ prefill TP rank 数 ÷ 同期完成请求数；分子为当前每 rank 的 KV 传输速率。窗口内曲线的均值即该时段真实 req/s；所选时段没有请求或没有 KV 传输时不显示数据点。",
    "gridPos": {
     "h": 8,
     "w": 12,
@@ -648,14 +627,8 @@
    "targets": [
     {
      "refId": "A",
-     "expr": "(sum(irate(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}[15s])) / ${kv_bytes_per_request:raw}) and on() (vector(${kv_bytes_per_request:raw}) > 0)",
-     "legendFormat": "KV total equivalent req/s",
-     "interval": "1s"
-    },
-    {
-     "refId": "B",
-     "expr": "(sum by (instance) (irate(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}[15s])) / ${kv_bytes_per_request:raw}) and on() (vector(${kv_bytes_per_request:raw}) > 0)",
-     "legendFormat": "KV {{instance}} equivalent req/s",
+     "expr": "(sum(irate(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}[15s])) / count(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"})) / (sum(increase(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}[$__range])) / count(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}) / sum(increase(vllm:request_success_total{instance=~\"prefill.*\",finished_reason!~\"abort|error\"}[$__range]))) and on() (sum(increase(vllm:flagcx_total_bytes_transferred_total{instance=~\"prefill.*\"}[$__range])) > 0) and on() (sum(increase(vllm:request_success_total{instance=~\"prefill.*\",finished_reason!~\"abort|error\"}[$__range])) > 0)",
+     "legendFormat": "KV real req/s",
      "interval": "1s"
     }
    ]
