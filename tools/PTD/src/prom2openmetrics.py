@@ -9,8 +9,13 @@ Each snapshot in the log starts with a header line written by the capture loop:
 Everything until the next header is one scrape. Samples get an `instance` label
 so prefill and decode stay distinguishable, and are emitted sorted by timestamp
 because promtool requires them non-decreasing.
+
+Conversion is streaming: each log holds one snapshot in memory at a time and
+the per-log streams are merged by timestamp, so multi-GB captures never need
+to fit in RAM.
 """
 
+import heapq
 import re
 import sys
 
@@ -30,60 +35,94 @@ def _with_instance(labels: str | None, instance: str) -> str:
     return labels[:-1] + "," + tag + "}"
 
 
-def _parse(path, instance: str, rows: dict) -> None:
+def _snapshots(path, instance: str, stats: dict):
+    """Yield (ts, {series: value}) per distinct timestamp, in file order.
+
+    Consecutive snapshots sharing a timestamp - a stray second capture loop
+    against the same port yields those, which promtool rejects - are merged
+    into one group with the last value winning, same as Prometheus would do.
+    Only the group being built is held in memory.
+    """
     ts = None
-    samples = snapshots = junk = 0
+    group: dict[str, str] = {}
     with open(path, errors="replace") as fh:
         for line in fh:
             line = line.rstrip("\r\n")
             header = HEADER.match(line)
             if header:
-                ts = int(header.group(1))
-                snapshots += 1
+                new_ts = int(header.group(1))
+                if ts is not None:
+                    if new_ts < ts:
+                        sys.exit(f"{path.name}: snapshot timestamp {new_ts} predates "
+                                 f"{ts}; capture logs must stay in scrape order")
+                    if new_ts != ts and group:
+                        yield ts, group
+                        group = {}
+                ts = new_ts
+                stats["snapshots"] += 1
             elif not line or line.startswith("#") or ts is None:
                 continue                      # HELP/TYPE lines and pre-header noise
             elif m := SAMPLE.match(line):
-                # Keyed by (series, ts): a stray second capture loop against the
-                # same port yields duplicate timestamps, which promtool rejects.
-                # Last value wins, same as Prometheus would do.
                 series = m.group("name") + _with_instance(m.group("labels"), instance)
-                rows[(series, ts)] = m.group("value")
-                samples += 1
+                group[series] = m.group("value")
+                stats["samples"] += 1
             else:
-                junk += 1                     # 404 pages, proxy errors, curl output
-    print(f"  {path.name:24s} instance={instance:8s} "
-          f"snapshots={snapshots:5d} samples={samples:8d} junk={junk}")
+                stats["junk"] += 1            # 404 pages, proxy errors, curl output
+    if group:
+        yield ts, group
 
 
 def bounds(path) -> tuple[int, int]:
     """First and last timestamp of an existing OpenMetrics file, in ms."""
-    stamps = [int(m.group(1)) for line in open(path, errors="replace")
-              if not line.startswith("#") and (m := TAIL_TS.search(line))]
-    if not stamps:
+    lo = hi = None
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            if m := TAIL_TS.search(line):
+                ts = int(m.group(1))
+                if lo is None or ts < lo:
+                    lo = ts
+                if hi is None or ts > hi:
+                    hi = ts
+    if lo is None:
         sys.exit(f"{path} has no timestamped samples")
-    return min(stamps) * 1000, max(stamps) * 1000
+    return lo * 1000, hi * 1000
 
 
 def convert(inputs, output) -> tuple[int, int]:
     """Write `inputs` [(path, instance), ...] to `output`. Returns (start, end) ms."""
-    rows: dict = {}
+    reported = []
+    streams = []
     for path, instance in inputs:
-        _parse(path, instance, rows)
-    if not rows:
+        stats = {"snapshots": 0, "samples": 0, "junk": 0}
+        reported.append((path, instance, stats))
+        streams.append(_snapshots(path, instance, stats))
+
+    # promtool requires timestamps to be non-decreasing; per-log snapshot
+    # streams are already ordered, so a k-way merge is enough.
+    total = 0
+    start = end = None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w") as fh:
+        for ts, group in heapq.merge(*streams, key=lambda item: item[0]):
+            for series, value in group.items():
+                fh.write(f"{series} {value} {ts}\n")
+            if start is None:
+                start = ts
+            end = ts
+            total += len(group)
+        fh.write("# EOF\n")
+
+    for path, instance, stats in reported:
+        print(f"  {path.name:24s} instance={instance:8s} "
+              f"snapshots={stats['snapshots']:5d} samples={stats['samples']:8d} "
+              f"junk={stats['junk']}")
+    if not total:
         sys.exit("no samples parsed - are the logs full of 404s? "
                  "The server needs --enable-metrics.")
 
-    # promtool requires timestamps to be non-decreasing.
-    ordered = sorted(rows.items(), key=lambda kv: kv[0][1])
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "w") as fh:
-        for (series, ts), value in ordered:
-            fh.write(f"{series} {value} {ts}\n")
-        fh.write("# EOF\n")
-
-    start, end = ordered[0][0][1], ordered[-1][0][1]
-    print(f"  -> {output.name}  {len(ordered)} samples  "
+    print(f"  -> {output.name}  {total} samples  "
           f"spanning {(end - start) / 60:.1f} min")
     return start * 1000, end * 1000
 
