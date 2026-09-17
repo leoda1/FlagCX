@@ -22,6 +22,7 @@
 #include "ib_common.h"
 #include "ibvwrap.h"
 #include "p2p_topo.h"
+#include "p2p_control.h"
 #include "param.h"
 #include "socket.h"
 
@@ -297,6 +298,7 @@ struct FlagcxP2pEngine {
   std::thread rpcServerThread;
   std::atomic<bool> rpcServerActive;
   std::atomic<bool> stopRpcServer;
+  std::atomic<uint64_t> runtimeSliceConfig;
   std::unordered_map<std::string, FlagcxP2pConn *> sessionConns;
   std::mutex sessionMutex;
   std::vector<FlagcxP2pConn *> acceptedConns;
@@ -1135,8 +1137,11 @@ buildAndSubmitToPool(PoolTransferTask *task, const std::vector<void *> &dataVec,
                      const std::vector<FlagcxP2pRdmaDesc> &descs,
                      const std::vector<FlagcxP2pMemRegEntry> &localEntries,
                      int numIovs, void *sendComm, int connIbDevN,
-                     uint8_t opcode) {
-  const auto &sliceCfg = flagcxP2pGlobalConfig();
+                     uint8_t opcode, FlagcxP2pEngine *engine) {
+  const uint64_t sliceCfg =
+      engine->runtimeSliceConfig.load(std::memory_order_acquire);
+  const size_t sliceSize = sliceCfg >> 32;
+  const size_t fragmentLimit = uint32_t(sliceCfg);
   for (int i = 0; i < numIovs; i++) {
     if (localEntries[i].ibDevN != connIbDevN) {
       WARN("NET/IB_P2P : iov[%d] ibDevN mismatch (%d vs conn %d)", i,
@@ -1151,13 +1156,15 @@ buildAndSubmitToPool(PoolTransferTask *task, const std::vector<void *> &dataVec,
     uint64_t remoteVa = descs[i].addr;
     flagcxBuildSlicesRuntime(&task->fx, localVa, remoteVa, sizeVec[i],
                              localMr->lkey, descs[i].rkey, opcode,
-                             sliceCfg.sliceSize, sliceCfg.fragmentLimit);
+                             sliceSize, fragmentLimit);
   }
 
   if (task->fx.sliceList.empty()) {
     return false;
   }
 
+  TRACE(FLAGCX_P2P, "pool submit iovs=%d slices=%zu sliceSize=%zu fragmentLimit=%zu",
+        numIovs, task->fx.sliceList.size(), sliceSize, fragmentLimit);
   flagcxResult_t rc =
       flagcxP2pPoolSubmit(connIbDevN, sendComm, task->fx.sliceList.data(),
                           (int)task->fx.sliceList.size());
@@ -2063,6 +2070,10 @@ FlagcxP2pEngine *flagcxP2pEngineCreate() {
   }
 
   FlagcxP2pEngine *engine = new FlagcxP2pEngine;
+  const auto &config = flagcxP2pGlobalConfig();
+  engine->runtimeSliceConfig.store(
+      flagcxP2pControl::pack(config.sliceSize, config.fragmentLimit),
+      std::memory_order_relaxed);
   engine->adaptor = &flagcxNetIbP2p;
   engine->topoMgr = NULL;
   engine->nDevs = 0;
@@ -2560,16 +2571,54 @@ FlagcxP2pConn *flagcxP2pEngineAccept(FlagcxP2pEngine *engine, char *ipAddrBuf,
     return NULL;
   }
 
-  // Step 2: Exchange IB listen handles over bootstrap
+  // The first bootstrap frame distinguishes legacy connect (tag 4) from
+  // runtime control. Do not establish any QP/MR state for a control request.
+  int header[2] = {};
+  const int fd = bsConn->p2p->sock.fd;
+  if (!flagcxP2pControl::receive(fd, header, sizeof(header), engine->stopAccept)) {
+    bootstrapClose(bsConn);
+    return NULL;
+  }
+  if (header[0] == flagcxP2pControl::kTag) {
+    if (header[1] <= 0 || header[1] > flagcxP2pControl::kMaxRequest) {
+      bootstrapClose(bsConn);
+      return NULL;
+    }
+    std::string request(header[1], '\0');
+    if (flagcxP2pControl::receive(fd, &request[0], request.size(),
+                                engine->stopAccept)) {
+      const char *error =
+          flagcxP2pControl::update(engine->runtimeSliceConfig, request);
+      const uint64_t config =
+          engine->runtimeSliceConfig.load(std::memory_order_acquire);
+      char reply[256];
+      const int length = snprintf(
+          reply, sizeof(reply),
+          "{\"status\":%d,\"slice_size\":%u,\"fragment_limit\":%u,"
+          "\"error\":\"%s\"}",
+          error ? -1 : 0, unsigned(config >> 32), unsigned(uint32_t(config)),
+          error ? error : "");
+      // Failure to deliver the ACK does not undo an applied update. GET lets
+      // the client resolve an uncertain result without retransmitting a SET.
+      bootstrapSend(bsConn, 0, flagcxP2pControl::kTag, reply, length);
+      if (!error && request != "GET")
+        INFO(FLAGCX_INIT, "P2P runtime config engine=%p sliceSize=%u fragmentLimit=%u",
+             engine, unsigned(config >> 32), unsigned(uint32_t(config)));
+    }
+    bootstrapClose(bsConn);
+    return NULL; // RPC accept loop continues; no data connection was created.
+  }
+
+  // Legacy handshake is unchanged on the wire; its header was consumed above.
   char localIbHandle[FLAGCX_NET_HANDLE_MAXSIZE];
   memcpy(localIbHandle, engine->listeners[dev].handle,
          FLAGCX_NET_HANDLE_MAXSIZE);
-
   char remoteIbHandle[FLAGCX_NET_HANDLE_MAXSIZE];
-  memset(remoteIbHandle, 0, sizeof(remoteIbHandle));
-  if (bootstrapExchange(bsConn, 0, 4, localIbHandle, FLAGCX_NET_HANDLE_MAXSIZE,
-                        remoteIbHandle,
-                        FLAGCX_NET_HANDLE_MAXSIZE) != flagcxSuccess) {
+  if (header[0] != 4 || header[1] != FLAGCX_NET_HANDLE_MAXSIZE ||
+      !flagcxP2pControl::receive(fd, remoteIbHandle, sizeof(remoteIbHandle),
+                               engine->stopAccept) ||
+      bootstrapSend(bsConn, 0, 4, localIbHandle, sizeof(localIbHandle)) !=
+          flagcxSuccess) {
     bootstrapClose(bsConn);
     return NULL;
   }
@@ -3115,7 +3164,8 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
   PoolTransferTask *task = acquirePoolTask();
 
   if (!buildAndSubmitToPool(task, dstVec, sizeVec, descs, localEntries, numIovs,
-                            conn->sendComm, connIbDevN, FLAGCX_SLICE_OP_READ)) {
+                            conn->sendComm, connIbDevN, FLAGCX_SLICE_OP_READ,
+                            conn->engine)) {
     // sentinel so isAllDone() converges (needs total>0)
     auto *sentinel = new FlagcxSlice{
         0, 0, 0, 0, 0, FLAGCX_SLICE_OP_READ, &task->fx, nullptr};
@@ -3228,7 +3278,7 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
 
   if (!buildAndSubmitToPool(task, dstVec, sizeVec, descs, localEntries, numIovs,
                             conn->sendComm, connIbDevN,
-                            FLAGCX_SLICE_OP_WRITE)) {
+                            FLAGCX_SLICE_OP_WRITE, conn->engine)) {
     auto *sentinel = new FlagcxSlice{
         0, 0, 0, 0, 0, FLAGCX_SLICE_OP_WRITE, &task->fx, nullptr};
     task->fx.sliceList.push_back(sentinel);
@@ -3652,7 +3702,7 @@ int flagcxP2pRpcBatchWriteSync(void *connPtr, int count, const uint64_t *srcVa,
   PoolTransferTask *task = acquirePoolTask();
   if (!buildAndSubmitToPool(task, srcVec, sizeVec, descs, localEntries, count,
                             conn->sendComm, connIbDevN,
-                            FLAGCX_SLICE_OP_WRITE)) {
+                            FLAGCX_SLICE_OP_WRITE, conn->engine)) {
     auto *sentinel = new FlagcxSlice{
         0, 0, 0, 0, 0, FLAGCX_SLICE_OP_WRITE, &task->fx, nullptr};
     task->fx.sliceList.push_back(sentinel);
