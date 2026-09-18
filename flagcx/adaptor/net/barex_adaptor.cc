@@ -137,6 +137,19 @@ static flagcxResult_t barexStatus(Status status) {
   return status.IsOk() ? flagcxSuccess : barexResult(status.ErrCode());
 }
 
+static int barexWorkerCount(const FlagcxP2pGlobalConfig &config) {
+  const char *env = flagcxGetEnv("FLAGCX_P2P_WORKERS_PER_POOL");
+  if (env == nullptr)
+    env = flagcxGetEnv("MC_WORKERS_PER_CTX");
+  if (env == nullptr)
+    return 10; /* Mooncake Barex default: ten context workers. */
+  char *end = nullptr;
+  const long value = strtol(env, &end, 10);
+  if (end == env || *end != '\0' || value <= 0 || value > 64)
+    return std::max(1, config.workersPerPool);
+  return static_cast<int>(value);
+}
+
 static void addrSetPort(union flagcxSocketAddress *addr, int port) {
   if (addr->sa.sa_family == AF_INET)
     addr->sin.sin_port = htons(port);
@@ -515,9 +528,8 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
     WARN("NET/BAREX : mempool: %s", bxstr(r));
     return flagcxInternalError;
   }
-  const int workerCount =
-      std::max(1, flagcxP2pGlobalConfig().workersPerPool);
-  const int connectorWorkers = std::max(2, workerCount);
+  const auto &workerConfig = flagcxP2pGlobalConfig();
+  const int workerCount = barexWorkerCount(workerConfig);
   XThreadpool::NewInstance(e->tpServer, workerCount, "flagcx-barex-server");
   XThreadpool::NewInstance(e->tpClient, workerCount, "flagcx-barex-client");
 
@@ -551,8 +563,8 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
          attempt++) {
       const int port = base + (int)d * 96 + attempt * 3;
       XListener *lis = nullptr;
-      if (XListener::NewInstance(lis, connectorWorkers, port,
-                                 accl::barex::TIMER_3S, oneServer) ==
+      if (XListener::NewInstance(lis, 2, port, accl::barex::TIMER_3S,
+                                 oneServer) ==
               accl::barex::BAREX_SUCCESS &&
           lis->Listen() == accl::barex::BAREX_SUCCESS) {
         e->listeners[d] = lis;
@@ -575,7 +587,7 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
   for (XContext *ctx : e->clientCtxs) {
     XConnector *con = nullptr;
     std::vector<XContext *> one = {ctx};
-    if (XConnector::NewInstance(con, connectorWorkers, accl::barex::TIMER_3S,
+    if (XConnector::NewInstance(con, 2, accl::barex::TIMER_3S,
                                 one) != accl::barex::BAREX_SUCCESS) {
       WARN("NET/BAREX : XConnector create failed");
       return flagcxInternalError;
