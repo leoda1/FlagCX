@@ -25,6 +25,7 @@
 #include "debug.h"
 #include "flagcx_net.h"
 #include "flagcx_net_adaptor.h"
+#include "flagcx_p2p.h"
 #include "net.h"
 #include "onesided.h"
 #include "param.h"
@@ -59,6 +60,7 @@
 #include <accl/barex/xthreadpool.h>
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -513,8 +515,11 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
     WARN("NET/BAREX : mempool: %s", bxstr(r));
     return flagcxInternalError;
   }
-  XThreadpool::NewInstance(e->tpServer, 4, "flagcx-barex-server");
-  XThreadpool::NewInstance(e->tpClient, 4, "flagcx-barex-client");
+  const int workerCount =
+      std::max(1, flagcxP2pGlobalConfig().workersPerPool);
+  const int connectorWorkers = std::max(2, workerCount);
+  XThreadpool::NewInstance(e->tpServer, workerCount, "flagcx-barex-server");
+  XThreadpool::NewInstance(e->tpClient, workerCount, "flagcx-barex-client");
 
   ContextConfig cfg = XConfigUtil::DefaultContextConfig();
   for (XDevice *dev : e->devs) {
@@ -546,8 +551,9 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
          attempt++) {
       const int port = base + (int)d * 96 + attempt * 3;
       XListener *lis = nullptr;
-      if (XListener::NewInstance(lis, 2, port, accl::barex::TIMER_3S,
-                                 oneServer) == accl::barex::BAREX_SUCCESS &&
+      if (XListener::NewInstance(lis, connectorWorkers, port,
+                                 accl::barex::TIMER_3S, oneServer) ==
+              accl::barex::BAREX_SUCCESS &&
           lis->Listen() == accl::barex::BAREX_SUCCESS) {
         e->listeners[d] = lis;
         e->barexPorts[d] = port;
@@ -569,8 +575,8 @@ static flagcxResult_t barexEngineStart(BarexEngine **out) {
   for (XContext *ctx : e->clientCtxs) {
     XConnector *con = nullptr;
     std::vector<XContext *> one = {ctx};
-    if (XConnector::NewInstance(con, 2, accl::barex::TIMER_3S, one) !=
-        accl::barex::BAREX_SUCCESS) {
+    if (XConnector::NewInstance(con, connectorWorkers, accl::barex::TIMER_3S,
+                                one) != accl::barex::BAREX_SUCCESS) {
       WARN("NET/BAREX : XConnector create failed");
       return flagcxInternalError;
     }

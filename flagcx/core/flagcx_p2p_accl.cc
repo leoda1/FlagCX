@@ -118,6 +118,7 @@ struct AcclMrEntry {
   uint32_t nKeys;
   uint32_t lkeys[kMaxNics]; /* indexed by ACCL device id */
   uint32_t rkeys[kMaxNics];
+  bool reusable = true;
 };
 
 struct AcclXfer {
@@ -458,7 +459,8 @@ bool findMrContaining(FlagcxAcclEngine *engine, uintptr_t addr, size_t size,
     return false;
   --it;
   const AcclMrEntry &e = it->second;
-  if (addr >= e.baseAddr && addr + size <= e.baseAddr + e.size) {
+  if (e.reusable && e.nKeys != 0 && addr >= e.baseAddr &&
+      addr + size <= e.baseAddr + e.size) {
     if (out)
       *out = e;
     return true;
@@ -526,17 +528,15 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
     WARN("NET/ACCL_P2P : v1 supports initiator-side transfers only");
     return -1;
   }
-  XChannel *ch = pickChannel(conn);
-  if (ch == nullptr) {
-    WARN("NET/ACCL_P2P : no active channel");
-    conn->state->fail(-1);
-    return -1;
-  }
-  const int localNic = ch->GetContext()->GetXDevice()->GetId();
-  const int peerNic = ch->GetPeerNicId();
 
-  auto batch = std::make_shared<std::vector<rw_memp_t>>();
-  batch->reserve(numIovs);
+  /* A vector transfer may span several channels.  Keep each channel's batch
+     homogeneous so its local/peer NIC ids and keys are resolved once, while
+     one transfer id still tracks all of the child batches. */
+  struct BatchWork {
+    XChannel *channel = nullptr;
+    std::shared_ptr<std::vector<rw_memp_t>> entries;
+  };
+  std::vector<BatchWork> works;
   for (int i = 0; i < numIovs; i++) {
     if (sizeVec[i] == 0)
       continue;
@@ -545,10 +545,27 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
            sizeVec[i]);
       return -1;
     }
+    XChannel *ch = pickChannel(conn);
+    if (ch == nullptr) {
+      WARN("NET/ACCL_P2P : no active channel");
+      conn->state->fail(-1);
+      return -1;
+    }
+    size_t workIdx = works.size();
+    for (size_t j = 0; j < works.size(); j++) {
+      if (works[j].channel == ch) {
+        workIdx = j;
+        break;
+      }
+    }
+    if (workIdx == works.size())
+      works.push_back({ch, std::make_shared<std::vector<rw_memp_t>>()});
+    auto &batch = *works[workIdx].entries;
+    const int localNic = ch->GetContext()->GetXDevice()->GetId();
+    const int peerNic = ch->GetPeerNicId();
+
     /* Registrations are chunked (vsolar 64MB per-MR cap), so one iov may
-       span several local MRs and several remote regions. Split at every
-       chunk boundary on either side; each slice carries the lkey/rkey of
-       the chunks it lands in. */
+       span several local MRs and several remote regions. */
     uintptr_t lcur = (uintptr_t)localVec[i];
     uint64_t rcur = descs[i].addr;
     size_t remaining = sizeVec[i];
@@ -570,9 +587,10 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
         slice = std::min(slice, (size_t)(rr->baseAddr + rr->size - rcur));
         rkey = regionKeyForNic(*rr, peerNic);
       } else {
-        /* no region table entry — trust the caller's desc keys wholesale */
         rkey = descKeyForNic(descs[i], peerNic);
       }
+      if (slice == 0)
+        return -1;
 
       rw_memp_t w{};
       w.sg.addr = (uint64_t)lcur;
@@ -583,21 +601,19 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
       w.r_addr = rcur;
       w.r_key = rkey;
       w.r_ttl_ms = UINT64_MAX;
-      batch->push_back(w);
-
+      batch.push_back(w);
       lcur += slice;
       rcur += slice;
       remaining -= slice;
     }
   }
-  if (batch->empty()) {
-    *transferId = 0; /* nothing to do; XferStatus(0) reports done */
+  if (works.empty()) {
+    *transferId = 0;
     return 0;
   }
 
   auto xfer = std::make_shared<AcclXfer>();
-  xfer->pending.store(1, std::memory_order_release);
-
+  xfer->pending.store((int)works.size(), std::memory_order_release);
   uint64_t id;
   {
     std::lock_guard<std::mutex> lk(engine->xferMu);
@@ -606,26 +622,29 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
   }
 
   std::shared_ptr<AcclConnState> connState = conn->state;
-  DoneCallback done = [connState, xfer, batch](Status s) {
-    if (!s.IsOk()) {
-      WARN("NET/ACCL_P2P : batch failed: %s", s.ErrMsg().c_str());
+  for (auto &work : works) {
+    DoneCallback done = [connState, xfer](Status s) {
+      if (!s.IsOk()) {
+        WARN("NET/ACCL_P2P : batch failed: %s", s.ErrMsg().c_str());
+        xfer->failed.fetch_add(1, std::memory_order_release);
+        if (!barexRetryable(s.ErrCode()))
+          connState->fail(-1);
+      }
+      xfer->pending.fetch_sub(1, std::memory_order_release);
+    };
+    BarexResult r = isRead ? work.channel->ReadBatch(work.entries, done, true)
+                           : work.channel->WriteBatch(work.entries, done, true);
+    if (r != BAREX_SUCCESS) {
+      WARN("NET/ACCL_P2P : %s sync error: %s",
+           isRead ? "ReadBatch" : "WriteBatch", bxstr(r));
       xfer->failed.fetch_add(1, std::memory_order_release);
-      if (!barexRetryable(s.ErrCode()))
-        connState->fail(-1);
+      xfer->pending.fetch_sub(1, std::memory_order_release);
+      if (!barexRetryable(r))
+        conn->state->fail(-1);
+      std::lock_guard<std::mutex> lk(engine->xferMu);
+      engine->xfers.erase(id);
+      return -1;
     }
-    xfer->pending.fetch_sub(1, std::memory_order_release);
-  };
-
-  BarexResult r = isRead ? ch->ReadBatch(batch, done, true)
-                         : ch->WriteBatch(batch, done, true);
-  if (r != BAREX_SUCCESS) {
-    WARN("NET/ACCL_P2P : %s sync error: %s",
-         isRead ? "ReadBatch" : "WriteBatch", bxstr(r));
-    std::lock_guard<std::mutex> lk(engine->xferMu);
-    engine->xfers.erase(id);
-    if (!barexRetryable(r))
-      conn->state->fail(-1);
-    return -1;
   }
   *transferId = id;
   return 0;
@@ -812,9 +831,14 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
     flagcxAcclEngineDestroy(EOut(engine));
     return nullptr;
   }
-  r = XThreadpool::NewInstance(engine->tpServer, 4, "flagcx-accl-server");
+  const int workerCount =
+      std::max(1, flagcxP2pGlobalConfig().workersPerPool);
+  const int connectorWorkers = std::max(2, workerCount);
+  r = XThreadpool::NewInstance(engine->tpServer, workerCount,
+                               "flagcx-accl-server");
   if (r == BAREX_SUCCESS)
-    r = XThreadpool::NewInstance(engine->tpClient, 4, "flagcx-accl-client");
+    r = XThreadpool::NewInstance(engine->tpClient, workerCount,
+                                 "flagcx-accl-client");
   if (r != BAREX_SUCCESS) {
     WARN("NET/ACCL_P2P : threadpool create failed: %s", bxstr(r));
     flagcxAcclEngineDestroy(EOut(engine));
@@ -857,7 +881,8 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
   for (int attempt = 0; attempt < 32; attempt++) {
     const int port = base + attempt * 3;
     XListener *lis = nullptr;
-    if (XListener::NewInstance(lis, 2, port, TIMER_3S, engine->serverCtxs) ==
+    if (XListener::NewInstance(lis, connectorWorkers, port, TIMER_3S,
+                                engine->serverCtxs) ==
             BAREX_SUCCESS &&
         lis->Listen() == BAREX_SUCCESS) {
       engine->listener = lis;
@@ -875,7 +900,7 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
     flagcxAcclEngineDestroy(EOut(engine));
     return nullptr;
   }
-  if (XConnector::NewInstance(engine->connector, 2, TIMER_3S,
+  if (XConnector::NewInstance(engine->connector, connectorWorkers, TIMER_3S,
                               engine->clientCtxs) != BAREX_SUCCESS) {
     WARN("NET/ACCL_P2P : XConnector create failed");
     flagcxAcclEngineDestroy(EOut(engine));
@@ -1208,6 +1233,12 @@ int flagcxAcclEngineReg(FlagcxP2pEngine *e, uintptr_t data, size_t size,
     std::lock_guard<std::mutex> lk(engine->mrMu);
     auto it = engine->mrByBase.find(data);
     if (it != engine->mrByBase.end()) {
+      if (!it->second.reusable || it->second.nKeys == 0) {
+        WARN("NET/ACCL_P2P : MR 0x%lx has a failed deregistration; "
+             "registration must use a different address",
+             (unsigned long)data);
+        return -1;
+      }
       if (it->second.regBase != data || it->second.regSize != size) {
         WARN("NET/ACCL_P2P : re-register 0x%lx with different size",
              (unsigned long)data);
@@ -1249,6 +1280,7 @@ int flagcxAcclEngineReg(FlagcxP2pEngine *e, uintptr_t data, size_t size,
 
     AcclMrEntry entry;
     memset(&entry, 0, sizeof(entry));
+    entry.reusable = true;
     entry.baseAddr = cbase;
     entry.size = csize;
     entry.regBase = data;
@@ -1303,9 +1335,20 @@ void flagcxAcclEngineMrDestroy(FlagcxP2pEngine *e, FlagcxP2pMr mr) {
   std::lock_guard<std::mutex> lk(engine->mrMu);
   for (auto it = engine->mrByBase.begin(); it != engine->mrByBase.end();) {
     if (it->second.mrId == mr) {
-      engine->mempool->DeregUserMr(reinterpret_cast<void *>(it->first),
-                                   it->second.dtype);
-      it = engine->mrByBase.erase(it);
+      BarexResult r = engine->mempool->DeregUserMr(
+          reinterpret_cast<void *>(it->first), it->second.dtype);
+      if (r != BAREX_SUCCESS) {
+        /* Keep the entry quarantined when deregistration fails.  Erasing it
+           would allow a later registration to reuse stale keys, while
+           retaining it makes the failure observable and retryable. */
+        WARN("NET/ACCL_P2P : DeregUserMr(%p) failed: %s",
+             reinterpret_cast<void *>(it->first), bxstr(r));
+        it->second.reusable = false;
+        it->second.nKeys = 0;
+        ++it;
+      } else {
+        it = engine->mrByBase.erase(it);
+      }
     } else {
       ++it;
     }
