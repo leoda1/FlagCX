@@ -51,7 +51,8 @@ def configure(endpoint, values=None, timeout=5.0):
     existing transfers. A timeout has an uncertain outcome: query with GET.
     """
     host, port = endpoint.rsplit(":", 1)
-    host = host.removeprefix("[").removesuffix("]")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     assignments = []
     for key, value in (values or {}).items():
         if key not in _RUNTIME_KEYS:

@@ -7,7 +7,8 @@
  *
  * Shape mirrors Mooncake's barex_transport: one XSimpleMempool over all
  * selected NICs (RegUserMr returns one MR/rkey per NIC); one server + client
- * XContext pair per NIC; XListener/XConnector own setup (no QP here);
+ * XContext pair on the NIC closest to the local GPU; XListener/XConnector own
+ * setup (no QP here);
  * transfers post via XChannel::WriteBatch/ReadBatch with callback
  * completion (no CQ poll); the per-slice remote key comes from the
  * region's per-NIC rkey vector via channel->GetPeerNicId().
@@ -25,8 +26,9 @@
 #include "adaptor.h"
 #include "bootstrap.h"
 #include "debug.h"
-#include "p2p_topo.h"
 #include "p2p_control.h"
+#include "p2p_scheduler.h"
+#include "p2p_topo.h"
 #include "param.h"
 #include "socket.h"
 
@@ -122,10 +124,7 @@ struct AcclMrEntry {
   uint32_t rkeys[kMaxNics];
 };
 
-struct AcclXfer {
-  std::atomic<int> pending{0};
-  std::atomic<int> failed{0};
-};
+using AcclXfer = flagcxP2pScheduling::CompletionTracker;
 
 enum AcclConnLifecycle : int {
   ACCL_CONN_ACTIVE = 0,
@@ -270,7 +269,7 @@ int acclWorkerCount(const FlagcxP2pGlobalConfig &config) {
   if (env == nullptr)
     return positiveEnv("MC_WORKERS_PER_CTX", 10, 64);
   return positiveEnv("FLAGCX_P2P_WORKERS_PER_POOL",
-                    std::max(1, config.workersPerPool), 64);
+                     std::max(1, config.workersPerPool), 64);
 }
 
 int acclQpsPerConn(const FlagcxP2pGlobalConfig &config) {
@@ -558,8 +557,8 @@ uint32_t regionKeyForNic(const AcclRemoteRegion &r, int nic) {
 
 bool peekBootstrapFrame(int fd, void *buffer, size_t size,
                         const std::atomic<bool> &stop, int timeoutMs = 5000) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(timeoutMs);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
   while (!stop.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < deadline) {
     pollfd pfd{fd, POLLIN, 0};
@@ -607,11 +606,19 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
         std::make_shared<std::vector<rw_memp_t>>();
   };
   std::vector<ChannelGroup> groups;
+  const int expectedNic = engine->devs[engine->selectedNetDev]->GetId();
   for (XChannel *channel : conn->channels) {
     if (channel == nullptr || !channel->IsActive())
       continue;
     const int localNic = channel->GetContext()->GetXDevice()->GetId();
     const int peerNic = channel->GetPeerNicId();
+    if (localNic != expectedNic) {
+      WARN("NET/ACCL_P2P : active channel on nic %d, expected GPU-local "
+           "nic %d",
+           localNic, expectedNic);
+      conn->state->fail(-1);
+      return -1;
+    }
     size_t group = groups.size();
     for (size_t i = 0; i < groups.size(); i++) {
       if (groups[i].localNic == localNic && groups[i].peerNic == peerNic) {
@@ -636,7 +643,9 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
       engine->runtimeSliceConfig.load(std::memory_order_acquire);
   const size_t sliceLimit = static_cast<size_t>(sliceConfig >> 32);
   const size_t fragmentLimit = static_cast<size_t>(uint32_t(sliceConfig));
-  uint64_t groupCursor = conn->rr.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t submissionTicket =
+      conn->rr.fetch_add(1, std::memory_order_relaxed);
+  uint64_t groupCursor = submissionTicket;
   for (int i = 0; i < numIovs; i++) {
     if (sizeVec[i] == 0)
       continue;
@@ -657,8 +666,7 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
             (groupCursor + attempt) % static_cast<uint64_t>(groups.size());
         AcclMrEntry candidate;
         if (!findMrContaining(engine, lcur, 1, &candidate)) {
-          WARN("NET/ACCL_P2P : local buffer %p not registered",
-               (void *)lcur);
+          WARN("NET/ACCL_P2P : local buffer %p not registered", (void *)lcur);
           return -1;
         }
         if (groups[group].localNic < 0 ||
@@ -676,13 +684,11 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
       }
       groupCursor = selectedGroup + 1;
 
-      size_t slice =
-          std::min(remaining, entry.baseAddr + entry.size - lcur);
+      size_t slice = std::min(remaining, entry.baseAddr + entry.size - lcur);
       uint32_t rkey;
       const AcclRemoteRegion *rr = findRemoteRegion(conn, rcur);
       if (rr != nullptr) {
-        slice = std::min(slice,
-                         (size_t)(rr->baseAddr + rr->size - rcur));
+        slice = std::min(slice, (size_t)(rr->baseAddr + rr->size - rcur));
         rkey = regionKeyForNic(*rr, selected->peerNic);
       } else {
         rkey = descKeyForNic(descs[i], selected->peerNic);
@@ -723,11 +729,13 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
     const size_t remainder = group.entries->size() % qpCount;
     size_t begin = 0;
     for (size_t i = 0; i < qpCount; i++) {
-      const size_t count = batchSize + (i == qpCount - 1 ? remainder : 0);
+      const size_t count = batchSize + (i < remainder ? 1 : 0);
       auto entries = std::make_shared<std::vector<rw_memp_t>>(
           group.entries->begin() + begin,
           group.entries->begin() + begin + count);
-      works.push_back({group.channels[i], std::move(entries)});
+      const size_t channelIndex = flagcxP2pScheduling::channelForTicket(
+          submissionTicket, i, group.channels.size());
+      works.push_back({group.channels[channelIndex], std::move(entries)});
       begin += count;
     }
   }
@@ -746,27 +754,35 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
   }
 
   std::shared_ptr<AcclConnState> connState = conn->state;
-  for (auto &work : works) {
+  for (size_t workIndex = 0; workIndex < works.size(); workIndex++) {
+    auto &work = works[workIndex];
     DoneCallback done = [connState, xfer, entries = work.entries](Status s) {
+      int failed = 0;
       if (!s.IsOk()) {
         WARN("NET/ACCL_P2P : batch failed: %s", s.ErrMsg().c_str());
-        xfer->failed.fetch_add(1, std::memory_order_release);
+        failed = 1;
         if (!barexRetryable(s.ErrCode()))
           connState->fail(-1);
       }
-      xfer->pending.fetch_sub(1, std::memory_order_release);
+      xfer->complete(1, failed);
     };
     BarexResult r = isRead ? work.channel->ReadBatch(work.entries, done, true)
                            : work.channel->WriteBatch(work.entries, done, true);
     if (r != BAREX_SUCCESS) {
       WARN("NET/ACCL_P2P : %s sync error: %s",
            isRead ? "ReadBatch" : "WriteBatch", bxstr(r));
-      xfer->failed.fetch_add(1, std::memory_order_release);
-      xfer->pending.fetch_sub(1, std::memory_order_release);
-      std::lock_guard<std::mutex> lk(engine->xferMu);
-      engine->xfers.erase(id);
       if (!barexRetryable(r))
         conn->state->fail(-1);
+      /* The failed work and every work after it were not accepted by ACCL.
+         Complete those slots locally, then drain callbacks for earlier
+         accepted batches before returning.  The caller receives no transfer
+         ID on an error, so returning sooner would allow its buffers to be
+         reused while an accepted batch still references them. */
+      const int unsubmitted = static_cast<int>(works.size() - workIndex);
+      xfer->complete(unsubmitted, unsubmitted);
+      xfer->wait();
+      std::lock_guard<std::mutex> lk(engine->xferMu);
+      engine->xfers.erase(id);
       return -1;
     }
   }
@@ -979,40 +995,39 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
   }
 
   ContextConfig cfg = XConfigUtil::DefaultContextConfig();
-  /* Mooncake creates one context pair per RNIC and lets the connector spread
-     QPs across all of them. Restricting ACCL to selectedNetDev silently
-     discarded the other rails and was the main throughput gap. */
-  for (XDevice *dev : engine->devs) {
-    XContext *sctx = nullptr;
-    XContext *cctx = nullptr;
-    BarexResult contextResult =
-        XContext::NewInstance(sctx, cfg, new AcclNullCb(), dev,
-                              engine->mempool, engine->tpServer);
-    if (contextResult == BAREX_SUCCESS)
-      contextResult =
-          XContext::NewInstance(cctx, cfg, new AcclNullCb(), dev,
-                                engine->mempool, engine->tpClient);
-    if (contextResult != BAREX_SUCCESS) {
-      WARN("NET/ACCL_P2P : XContext create failed on %s",
-           dev->GetName().c_str());
-      if (sctx != nullptr) {
-        sctx->Shutdown();
-        sctx->WaitStop();
-        delete sctx;
-      }
-      if (cctx != nullptr) {
-        cctx->Shutdown();
-        cctx->WaitStop();
-        delete cctx;
-      }
-      flagcxAcclEngineDestroy(EOut(engine));
-      return nullptr;
+  /* A P2P engine is scoped to one local GPU. Bind its data endpoint to the
+     topology-selected NIC; exposing every RNIC here bypasses that decision
+     and can create channels on non-local HCAs. */
+  XDevice *selectedDev = engine->devs[engine->selectedNetDev];
+  XContext *sctx = nullptr;
+  XContext *cctx = nullptr;
+  BarexResult contextResult =
+      XContext::NewInstance(sctx, cfg, new AcclNullCb(), selectedDev,
+                            engine->mempool, engine->tpServer);
+  if (contextResult == BAREX_SUCCESS)
+    contextResult =
+        XContext::NewInstance(cctx, cfg, new AcclNullCb(), selectedDev,
+                              engine->mempool, engine->tpClient);
+  if (contextResult != BAREX_SUCCESS) {
+    WARN("NET/ACCL_P2P : XContext create failed on %s",
+         selectedDev->GetName().c_str());
+    if (sctx != nullptr) {
+      sctx->Shutdown();
+      sctx->WaitStop();
+      delete sctx;
     }
-    sctx->Start();
-    cctx->Start();
-    engine->serverCtxs.push_back(sctx);
-    engine->clientCtxs.push_back(cctx);
+    if (cctx != nullptr) {
+      cctx->Shutdown();
+      cctx->WaitStop();
+      delete cctx;
+    }
+    flagcxAcclEngineDestroy(EOut(engine));
+    return nullptr;
   }
+  sctx->Start();
+  cctx->Start();
+  engine->serverCtxs.push_back(sctx);
+  engine->clientCtxs.push_back(cctx);
 
   /* barex data-plane listener: probe for a free port */
   const int base = 18000 + (int)(getpid() % 4096);
@@ -1075,12 +1090,12 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
   }
 
   INFO(FLAGCX_INIT,
-       "NET/ACCL_P2P : engine up (gpu=%d nics=%d barex=%d bootstrap=%d "
-       "notif=%d workers=%d qps=%d slice=%u fragment=%u)",
-       engine->localGpuIdx, engine->nDevs, engine->barexPort,
-       engine->bsListenPort, engine->notifPort, workerCount,
-       acclQpsPerConn(p2pConfig),
-       defaultSlice, defaultFragment);
+       "NET/ACCL_P2P : engine up (gpu=%d registered_nics=%d data_nic=%d "
+       "barex=%d bootstrap=%d notif=%d workers=%d qps=%d slice=%u "
+       "fragment=%u)",
+       engine->localGpuIdx, engine->nDevs, selectedDev->GetId(),
+       engine->barexPort, engine->bsListenPort, engine->notifPort, workerCount,
+       acclQpsPerConn(p2pConfig), defaultSlice, defaultFragment);
   return EOut(engine);
 }
 
@@ -1232,14 +1247,14 @@ FlagcxP2pConn *flagcxAcclEngineConnect(FlagcxP2pEngine *e, const char *ipAddr,
   (void)remoteGpuIdx;
   (void)sameProcess; /* v1: no IPC fast path */
 
-  /* data-plane channels: qpsPerCtx per client ctx. Control block shared
-     with callbacks; on timeout a late callback sees `abandoned` and
+  /* All data-plane QPs stay on the GPU-local client context. Control block
+     shared with callbacks; on timeout a late callback sees `abandoned` and
      destroys its own channel instead of touching freed state. */
   const auto &config = flagcxP2pGlobalConfig();
   /* Mooncake Barex defaults to two QPs per endpoint. Keep the FlagCX
      override when explicitly supplied, otherwise use the same default. */
   const int qps = acclQpsPerConn(config);
-  const int total = qps * (int)engine->clientCtxs.size();
+  const int total = qps;
   auto ctl = std::make_shared<AcclConnectCtl>(total);
   for (int i = 0; i < total; i++) {
     BarexResult r = engine->connector->Connect(
@@ -1277,6 +1292,18 @@ FlagcxP2pConn *flagcxAcclEngineConnect(FlagcxP2pEngine *e, const char *ipAddr,
          peerBarexPort);
     flagcxAcclEngineConnDestroy(COut(conn));
     return nullptr;
+  }
+  const int expectedNic = engine->devs[engine->selectedNetDev]->GetId();
+  for (XChannel *channel : conn->channels) {
+    XContext *context = channel == nullptr ? nullptr : channel->GetContext();
+    XDevice *device = context == nullptr ? nullptr : context->GetXDevice();
+    const int actualNic = device == nullptr ? -1 : device->GetId();
+    if (actualNic != expectedNic) {
+      WARN("NET/ACCL_P2P : channel on nic %d, expected GPU-local nic %d",
+           actualNic, expectedNic);
+      flagcxAcclEngineConnDestroy(COut(conn));
+      return nullptr;
+    }
   }
   if (!allUp)
     WARN("NET/ACCL_P2P : %zu/%d channels up (continuing)",
@@ -1329,12 +1356,12 @@ FlagcxP2pConn *flagcxAcclEngineAccept(FlagcxP2pEngine *e, char *ipAddrBuf,
       const uint64_t config =
           engine->runtimeSliceConfig.load(std::memory_order_acquire);
       char reply[256];
-      const int length = snprintf(
-          reply, sizeof(reply),
-          "{\"status\":%d,\"slice_size\":%u,\"fragment_limit\":%u,"
-          "\"error\":\"%s\"}",
-          error == nullptr ? 0 : -1, unsigned(config >> 32),
-          unsigned(uint32_t(config)), error == nullptr ? "" : error);
+      const int length =
+          snprintf(reply, sizeof(reply),
+                   "{\"status\":%d,\"slice_size\":%u,\"fragment_limit\":%u,"
+                   "\"error\":\"%s\"}",
+                   error == nullptr ? 0 : -1, unsigned(config >> 32),
+                   unsigned(uint32_t(config)), error == nullptr ? "" : error);
       bootstrapSend(bsConn, 0, flagcxP2pControl::kTag, reply, length);
     }
     bootstrapClose(bsConn);
