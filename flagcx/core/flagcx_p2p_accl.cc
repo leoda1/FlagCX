@@ -253,63 +253,22 @@ bool barexRetryable(BarexResult result) {
   return result == BAREX_ERR_QUEUE_FULL || result == BAREX_ERR_RATE_LIMITED;
 }
 
-int positiveEnv(const char *name, int fallback, int maximum) {
-  const char *env = flagcxGetEnv(name);
-  if (env == nullptr)
-    return fallback;
-  char *end = nullptr;
-  const long value = strtol(env, &end, 10);
-  if (end == env || *end != '\0' || value <= 0 || value > maximum)
-    return fallback;
-  return static_cast<int>(value);
-}
-
 int acclWorkerCount(const FlagcxP2pGlobalConfig &config) {
-  const char *env = flagcxGetEnv("FLAGCX_P2P_WORKERS_PER_POOL");
-  if (env == nullptr)
-    return positiveEnv("MC_WORKERS_PER_CTX", 10, 64);
-  return positiveEnv("FLAGCX_P2P_WORKERS_PER_POOL",
-                     std::max(1, config.workersPerPool), 64);
+  return std::max(1, config.workersPerPool);
 }
 
 int acclQpsPerConn(const FlagcxP2pGlobalConfig &config) {
-  if (flagcxGetEnv("FLAGCX_P2P_QPS_PER_CONN") != nullptr)
-    return config.qpsPerConn;
-  return positiveEnv("MC_NUM_QP_PER_EP", 2, 64);
-}
-
-uint32_t acclSizeEnv(const char *name, uint32_t fallback) {
-  const char *env = flagcxGetEnv(name);
-  if (env == nullptr)
-    return fallback;
-  char *end = nullptr;
-  const unsigned long value = strtoul(env, &end, 10);
-  if (end == env || *end != '\0' || value == 0 ||
-      value > flagcxP2pControl::kMaxSliceSize)
-    return fallback;
-  return static_cast<uint32_t>(value);
+  return std::max(1, config.qpsPerConn);
 }
 
 uint32_t acclSliceSize(const FlagcxP2pGlobalConfig &config) {
-  if (flagcxGetEnv("FLAGCX_P2P_SLICE_SIZE") != nullptr)
-    return static_cast<uint32_t>(config.sliceSize);
-  return acclSizeEnv("MC_SLICE_SIZE", 64u * 1024u);
+  return static_cast<uint32_t>(config.sliceSize);
 }
 
 uint32_t acclFragmentLimit(const FlagcxP2pGlobalConfig &config,
                            uint32_t slice) {
-  if (flagcxGetEnv("FLAGCX_P2P_FRAGMENT_LIMIT") != nullptr)
-    return static_cast<uint32_t>(config.fragmentLimit);
-  const char *limit = flagcxGetEnv("MC_FRAGMENT_LIMIT");
-  if (limit != nullptr)
-    return std::min(acclSizeEnv("MC_FRAGMENT_LIMIT", 16u * 1024u), slice);
-  const char *ratioEnv = flagcxGetEnv("MC_FRAGMENT_RATIO");
-  const int ratio = positiveEnv("MC_FRAGMENT_RATIO", 0, 1 << 20);
-  if (ratioEnv != nullptr)
-    return ratio > 0 && static_cast<uint32_t>(ratio) < slice
-               ? slice / static_cast<uint32_t>(ratio)
-               : slice / 4;
-  return std::min<uint32_t>(16u * 1024u, slice);
+  return std::min<uint32_t>(static_cast<uint32_t>(config.fragmentLimit),
+                            slice);
 }
 
 uint16_t addrPort(const union flagcxSocketAddress *addr) {
@@ -756,13 +715,21 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
   std::shared_ptr<AcclConnState> connState = conn->state;
   for (size_t workIndex = 0; workIndex < works.size(); workIndex++) {
     auto &work = works[workIndex];
-    DoneCallback done = [connState, xfer, entries = work.entries](Status s) {
+    const int localNic = work.channel->GetContext()->GetXDevice()->GetId();
+    const int peerNic = work.channel->GetPeerNicId();
+    const size_t entryCount = work.entries->size();
+    DoneCallback done = [connState, xfer, entries = work.entries, localNic,
+                         peerNic, entryCount](Status s) {
+      (void)entries;
       int failed = 0;
       if (!s.IsOk()) {
-        WARN("NET/ACCL_P2P : batch failed: %s", s.ErrMsg().c_str());
+        WARN("NET/ACCL_P2P : batch failed localNic=%d peerNic=%d entries=%zu: %s",
+             localNic, peerNic, entryCount, s.ErrMsg().c_str());
         failed = 1;
-        if (!barexRetryable(s.ErrCode()))
+        if (!barexRetryable(s.ErrCode())) {
+          xfer->hardFailed.fetch_add(1, std::memory_order_release);
           connState->fail(-1);
+        }
       }
       xfer->complete(1, failed);
     };
@@ -923,9 +890,6 @@ FlagcxP2pEngine *flagcxAcclEngineCreate() {
   engine->localGpuIdx = inferLocalGpuIdxAccl();
   memset(&engine->notifListenSock, 0, sizeof(engine->notifListenSock));
 
-  /* Match Mooncake Barex's 64 KiB slice and 16 KiB remainder merge by
-     default. Explicit FlagCX environment values still override these
-     defaults and can subsequently be changed through the RPC control path. */
   const auto &p2pConfig = flagcxP2pGlobalConfig();
   const uint32_t defaultSlice = acclSliceSize(p2pConfig);
   const uint32_t defaultFragment = acclFragmentLimit(p2pConfig, defaultSlice);
@@ -1647,27 +1611,37 @@ int flagcxAcclEngineWriteVector(FlagcxP2pConn *c,
   return acclSubmit(conn, srcVec, sizeVec, descs, numIovs, false, transferId);
 }
 
-bool flagcxAcclEngineXferStatus(FlagcxP2pConn *c, uint64_t transferId) {
-  FlagcxAcclConn *conn = C(c);
+int acclXferPoll(FlagcxAcclEngine *engine, FlagcxAcclConn *conn,
+                 uint64_t transferId) {
   if (conn == nullptr || transferId == 0)
-    return true;
-  FlagcxAcclEngine *engine = conn->engine;
+    return 1;
   std::shared_ptr<AcclXfer> xfer;
   {
     std::lock_guard<std::mutex> lk(engine->xferMu);
     auto it = engine->xfers.find(transferId);
     if (it == engine->xfers.end())
-      return true;
+      return 1;
     xfer = it->second;
   }
   if (xfer->pending.load(std::memory_order_acquire) > 0)
-    return false;
-  if (xfer->failed.load(std::memory_order_acquire) > 0)
+    return 0;
+  const bool failed = xfer->failed.load(std::memory_order_acquire) > 0;
+  if (failed) {
     WARN("NET/ACCL_P2P : transfer %llu completed with failures",
          (unsigned long long)transferId);
+    if (xfer->hardFailed.load(std::memory_order_acquire) > 0)
+      conn->state->fail(-1);
+  }
   std::lock_guard<std::mutex> lk(engine->xferMu);
   engine->xfers.erase(transferId);
-  return true;
+  return failed ? -1 : 1;
+}
+
+bool flagcxAcclEngineXferStatus(FlagcxP2pConn *c, uint64_t transferId) {
+  FlagcxAcclConn *conn = C(c);
+  if (conn == nullptr)
+    return true;
+  return acclXferPoll(conn->engine, conn, transferId) != 0;
 }
 
 int flagcxAcclEngineWriteVectorSync(
@@ -1682,9 +1656,13 @@ int flagcxAcclEngineWriteVectorSync(
                                              numIovs, &transferId);
   if (rc != 0)
     return rc;
-  while (!flagcxAcclEngineXferStatus(c, transferId))
+  FlagcxAcclConn *conn = C(c);
+  if (conn == nullptr)
+    return -1;
+  int status;
+  while ((status = acclXferPoll(conn->engine, conn, transferId)) == 0)
     std::this_thread::yield();
-  return 0;
+  return status < 0 ? -1 : 0;
 }
 
 int flagcxAcclEngineGetMetadata(FlagcxP2pEngine *e, char **metadataStr) {

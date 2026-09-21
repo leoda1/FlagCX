@@ -138,16 +138,7 @@ static flagcxResult_t barexStatus(Status status) {
 }
 
 static int barexWorkerCount(const FlagcxP2pGlobalConfig &config) {
-  const char *env = flagcxGetEnv("FLAGCX_P2P_WORKERS_PER_POOL");
-  if (env == nullptr)
-    env = flagcxGetEnv("MC_WORKERS_PER_CTX");
-  if (env == nullptr)
-    return 10; /* Mooncake Barex default: ten context workers. */
-  char *end = nullptr;
-  const long value = strtol(env, &end, 10);
-  if (end == env || *end != '\0' || value <= 0 || value > 64)
-    return std::max(1, config.workersPerPool);
-  return static_cast<int>(value);
+  return std::max(1, config.workersPerPool);
 }
 
 static void addrSetPort(union flagcxSocketAddress *addr, int port) {

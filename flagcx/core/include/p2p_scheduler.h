@@ -40,6 +40,7 @@ inline size_t channelForTicket(uint64_t ticket, size_t ordinal,
 struct CompletionTracker {
   std::atomic<int> pending{0};
   std::atomic<int> failed{0};
+  std::atomic<int> hardFailed{0};
   std::mutex waitMu;
   std::condition_variable waitCv;
 
