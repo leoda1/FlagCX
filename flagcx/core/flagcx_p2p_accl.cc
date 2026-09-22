@@ -267,8 +267,7 @@ uint32_t acclSliceSize(const FlagcxP2pGlobalConfig &config) {
 
 uint32_t acclFragmentLimit(const FlagcxP2pGlobalConfig &config,
                            uint32_t slice) {
-  return std::min<uint32_t>(static_cast<uint32_t>(config.fragmentLimit),
-                            slice);
+  return std::min<uint32_t>(static_cast<uint32_t>(config.fragmentLimit), slice);
 }
 
 uint16_t addrPort(const union flagcxSocketAddress *addr) {
@@ -723,7 +722,8 @@ int acclSubmit(FlagcxAcclConn *conn, const std::vector<void *> &localVec,
       (void)entries;
       int failed = 0;
       if (!s.IsOk()) {
-        WARN("NET/ACCL_P2P : batch failed localNic=%d peerNic=%d entries=%zu: %s",
+        WARN("NET/ACCL_P2P : batch failed localNic=%d peerNic=%d entries=%zu: "
+             "%s",
              localNic, peerNic, entryCount, s.ErrMsg().c_str());
         failed = 1;
         if (!barexRetryable(s.ErrCode())) {

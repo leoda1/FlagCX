@@ -4,8 +4,8 @@
 #define FLAGCX_P2P_CONTROL_H_
 
 #include <atomic>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <poll.h>
 #include <string>
@@ -37,8 +37,9 @@ inline const char *update(std::atomic<uint64_t> &config,
     if (eq == std::string::npos)
       return "expected KEY=decimal";
     const std::string key = line.substr(0, eq);
-    const unsigned bit = key == "FLAGCX_P2P_SLICE_SIZE" ? 1 :
-                         key == "FLAGCX_P2P_FRAGMENT_LIMIT" ? 2 : 0;
+    const unsigned bit = key == "FLAGCX_P2P_SLICE_SIZE"       ? 1
+                         : key == "FLAGCX_P2P_FRAGMENT_LIMIT" ? 2
+                                                              : 0;
     if (bit == 0)
       return "parameter is not runtime tunable";
     if (seen & bit)
@@ -73,8 +74,8 @@ inline const char *update(std::atomic<uint64_t> &config,
 // forever. Poll in short intervals to respect engine shutdown.
 inline bool receive(int fd, void *buffer, size_t size,
                     const std::atomic<bool> &stop, int timeoutMs = 5000) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(timeoutMs);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
   char *out = static_cast<char *>(buffer);
   while (size) {
     if (stop.load(std::memory_order_acquire) ||
