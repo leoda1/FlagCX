@@ -22,7 +22,7 @@ cd "$(dirname "$0")"
 ROLE=${1:?server|client}
 ADDR=${2:?address}
 ITERS=${3:-2000}
-LOG=claude-trash
+LOG=log
 mkdir -p "$LOG"
 
 # stale processes from an aborted run hold the zmq ports / GPU memory
@@ -42,9 +42,8 @@ export FLAGCX_DMABUF_ENABLE=0
 export FLAGCX_P2P_QPS_PER_CONN=2
 export FLAGCX_P2P_SLICE_SIZE=67108864
 export PASS_ALLOC=1
-# NOTE: ACCL_SELECT_NIC (from the serving env) is NOT set here — it drives
-# barex's own NIC selection and made MrForAllDevices fail with res=3; the
-# FlagCX accl engine does its own topo-based NIC pick per GPU.
+export ACCL_SELECT_NIC=1
+export FLAGCX_IB_HCA=vsolar_0
 export ACCL_WRITEBATCH_OPT=2
 export ACCL_POST_RECV_SIZE=4
 export ACCL_LOW_LATENCY_OPTIMIZE=1
@@ -64,7 +63,7 @@ COMMON="--connector=flagcx --real-pattern $PATTERN --iters $ITERS --warmup 2 --d
 
 PIDS=()
 if [ "$ROLE" = server ]; then
-  for gpu in 0 1; do
+  for gpu in 0 1 2 3; do
     port=$((4566 + gpu * 10))
     python3 kv_transfer_benchmark_noncontig.py --role=server --remote-ip="$ADDR" \
         --advertise-ip="$ADDR" --zmq-port=$port --local-gpu-idx=$gpu $COMMON \
@@ -73,7 +72,7 @@ if [ "$ROLE" = server ]; then
   done
 else
   sleep 5
-  for gpu in 0 1; do
+  for gpu in 0 1 2 3; do
     port=$((4566 + gpu * 10))
     python3 kv_transfer_benchmark_noncontig.py --role=client --remote-ip="$ADDR" \
         --zmq-port=$port --local-gpu-idx=$gpu $COMMON \
