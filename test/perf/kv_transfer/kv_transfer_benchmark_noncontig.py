@@ -446,7 +446,12 @@ class FlagCXTransport(Transport):
         if "server" in self.role:
             self.flagcx.flagcxP2pStartRpcServer(self.engine)
             rpc_port = self.flagcx.flagcxP2pGetRpcPort(self.engine)
-            host = self.remote_ip
+            # advertise the address the CLIENT should dial: our own IP, not
+            # --remote-ip (which names the peer). --advertise-ip wins for
+            # multi-homed hosts; hostname lookup is the single-host default.
+            host = getattr(self.args, "advertise_ip", None)
+            if not host:
+                host = self.remote_ip
             if host in ("", "0.0.0.0", None):
                 host = socket.gethostbyname(socket.gethostname())
             self.sock.send(json.dumps({"session": f"{host}:{rpc_port}",
@@ -525,6 +530,10 @@ def main() -> None:
     p.add_argument("--connector", choices=["nixl", "mooncake", "flagcx"], required=True)
     p.add_argument("--role", choices=["server", "client"], required=True)
     p.add_argument("--remote-ip", default="0.0.0.0")
+    p.add_argument("--advertise-ip", default=None,
+                   help="server: address announced to the client in the "
+                        "session string (defaults to hostname lookup; must "
+                        "be set when the server is multi-homed)")
     p.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--local-gpu-idx", type=int, default=0)
     p.add_argument("--block-bytes", type=int, default=8192,
