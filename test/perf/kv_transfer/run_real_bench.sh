@@ -58,6 +58,15 @@ if [ "$ROLE" = server ]; then
     PIDS+=($!)
   done
 else
+  # Derive the egress interface the kernel actually uses towards the server
+  # (all eth0..3 are /32; the route may leave via any of them). unicm bind
+  # AND the data NIC must match that egress or the EIC CID table rejects the
+  # first WR with "Send CID HW Error".
+  SRC_IF=$(ip route get "$ADDR" | head -1 | sed -n 's/.* dev \([a-z0-9]*\) .*/\1/p')
+  NIC_ID=${SRC_IF#eth}
+  export NCCL_SOCKET_IFNAME="$SRC_IF"
+  export FLAGCX_IB_HCA="vsolar_$NIC_ID"
+  echo "client egress: $SRC_IF -> $FLAGCX_IB_HCA"
   sleep 5
   for gpu in 0 1; do
     port=$((4566 + gpu * 10))
