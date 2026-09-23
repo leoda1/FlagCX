@@ -1,26 +1,22 @@
 #!/bin/bash
 # Real-inference KV transfer benchmark on PPU (FlagCX p2p accl backend).
 #
-# Replays the two most frequent transfer patterns from a real prefill log
-# (167.788 MiB / 1950 WRs and 1464.328 MiB / 1014 WRs, non-uniform lengths).
+# Replays transfer patterns from a real prefill log (non-uniform lengths).
 # Cross-machine, one direction (mirrors prefill->decode KV transfer):
-#
-#   client machine                          server machine
+#   client machine                        server machine
 #   GPU0 -> server GPU0   (zmq 4566)
 #   GPU1 -> server GPU1   (zmq 4576)
 #
-# Single NIC vsolar_0 on both sides. Same-machine pairs are NOT supported:
-# the EIC connection table rejects self-connected CID paths (Send CID HW
-# Error / send retry exhausted, observed 2026-09-23).
+# Environment mirrors the production serving env (net0 for all socket
+# planes, ACCL_SELECT_NIC=1 with NO FLAGCX_IB_HCA whitelist, the
+# FLAGCX_P2P_*/ACCL_* tuning set). Deploy-side variables are all ruled out:
+# same-host self-connect, iface mismatches and vsolar_N crossings all fail
+# with the same EIC "Send CID HW Error" — do not re-derive iface logic here.
 #
 # Usage:
-#   server machine: bash run_real_bench.sh server <own-eth0-ip> [iters]
-#   client machine: bash run_real_bench.sh client <server-eth0-ip> [iters]
-#
-# All planes (zmq, FlagCX rpc/hello, barex unicm) MUST stay on the same
-# interface (eth0 / 22.2.x RDMA net): the EIC connection table is keyed by
-# the address the hello exchange advertises; mixing net0 (hello) with eth0
-# (unicm bind) yields "Send CID HW Error" on first WR.
+#   server machine: bash run_real_bench.sh server <own-net0-ip> [iters]
+#   client machine: bash run_real_bench.sh client <server-net0-ip> [iters]
+#   PATTERN_JSON=small_only.json to subset patterns; iters small to smoke.
 set -u
 cd "$(dirname "$0")"
 ROLE=${1:?server|client}
@@ -35,26 +31,30 @@ for pid in $(pgrep -f kv_transfer_benchmark_noncontig.py); do
 done
 sleep 1
 
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
 FLAGCX_ROOT=$(cd ../../.. && pwd)
+export FLAGCX_PATH="$FLAGCX_ROOT"
+export LD_LIBRARY_PATH="$FLAGCX_ROOT/build/lib:${LD_LIBRARY_PATH:-}"
 export FLAGCX_P2P_TRANSPORT=accl
-if [ "$ROLE" = server ]; then
-  # server interface is picked by the caller (SRV_IF, default eth0); both the
-  # FlagCX listener and the barex unicm bind must sit on it. Pick the one the
-  # client's route egress lands on (same ethN both sides => same vsolar_N).
-  SRV_IF=${SRV_IF:-eth0}
-  export FLAGCX_SOCKET_IFNAME="$SRV_IF"
-  export NCCL_SOCKET_IFNAME="$SRV_IF"
-  export FLAGCX_IB_HCA="vsolar_${SRV_IF#eth}"
-else
-  :  # client derives its egress below
-fi
-export FLAGCX_MEM_ENABLE=1
 export FLAGCX_VMM_ENABLE=0
+export FLAGCX_DMABUF_ENABLE=0
+export FLAGCX_P2P_QPS_PER_CONN=2
+export FLAGCX_P2P_SLICE_SIZE=67108864
+export PASS_ALLOC=1
+export ACCL_SELECT_NIC=1
+export ACCL_WRITEBATCH_OPT=2
+export ACCL_POST_RECV_SIZE=4
+export ACCL_LOW_LATENCY_OPTIMIZE=1
+export FIC2_OOO_DISABLE_0115=1
+export FLAGCX_SOCKET_IFNAME=net0
+export NCCL_SOCKET_IFNAME=net0
+export GLOO_SOCKET_IFNAME=net0
 export FLAGCX_DEBUG=INFO
 export FLAGCX_DEBUG_SUBSYS=INIT
-export LD_LIBRARY_PATH="$FLAGCX_ROOT/build/lib:${LD_LIBRARY_PATH:-}"
 
-COMMON="--connector=flagcx --real-pattern real_patterns.json --iters $ITERS --warmup 20 --device gpu"
+PATTERN=${PATTERN_JSON:-real_patterns.json}
+COMMON="--connector=flagcx --real-pattern $PATTERN --iters $ITERS --warmup 2 --device gpu"
 
 PIDS=()
 if [ "$ROLE" = server ]; then
@@ -66,16 +66,6 @@ if [ "$ROLE" = server ]; then
     PIDS+=($!)
   done
 else
-  # Derive the egress interface the kernel actually uses towards the server
-  # (all eth0..3 are /32; the route may leave via any of them). unicm bind
-  # AND the data NIC must match that egress or the EIC CID table rejects the
-  # first WR with "Send CID HW Error".
-  SRC_IF=$(ip route get "$ADDR" | head -1 | sed -n 's/.* dev \([a-z0-9]*\) .*/\1/p')
-  NIC_ID=${SRC_IF#eth}
-  export NCCL_SOCKET_IFNAME="$SRC_IF"
-  export FLAGCX_SOCKET_IFNAME="$SRC_IF"
-  export FLAGCX_IB_HCA="vsolar_$NIC_ID"
-  echo "client egress: $SRC_IF -> $FLAGCX_IB_HCA"
   sleep 5
   for gpu in 0 1; do
     port=$((4566 + gpu * 10))
