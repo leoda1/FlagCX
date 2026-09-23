@@ -42,13 +42,15 @@ export FLAGCX_DMABUF_ENABLE=0
 export FLAGCX_P2P_QPS_PER_CONN=2
 export FLAGCX_P2P_SLICE_SIZE=67108864
 export PASS_ALLOC=1
-export ACCL_SELECT_NIC=1
+# NOTE: ACCL_SELECT_NIC (from the serving env) is NOT set here — it drives
+# barex's own NIC selection and made MrForAllDevices fail with res=3; the
+# FlagCX accl engine does its own topo-based NIC pick per GPU.
 export ACCL_WRITEBATCH_OPT=2
 export ACCL_POST_RECV_SIZE=4
 export ACCL_LOW_LATENCY_OPTIMIZE=1
 export FIC2_OOO_DISABLE_0115=1
 export FLAGCX_SOCKET_IFNAME=net0
-export NCCL_SOCKET_IFNAME=net0
+export NCCL_SOCKET_IFNAME=${NCCL_IF:-net0}
 export GLOO_SOCKET_IFNAME=net0
 export FLAGCX_DEBUG=INFO
 export FLAGCX_DEBUG_SUBSYS=INIT
