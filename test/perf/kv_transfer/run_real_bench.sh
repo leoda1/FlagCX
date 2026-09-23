@@ -49,8 +49,12 @@ export ACCL_WRITEBATCH_OPT=2
 export ACCL_POST_RECV_SIZE=4
 export ACCL_LOW_LATENCY_OPTIMIZE=1
 export FIC2_OOO_DISABLE_0115=1
-export FLAGCX_SOCKET_IFNAME=net0
-export NCCL_SOCKET_IFNAME=${NCCL_IF:-net0}
+# IFACE must be a vsolar-backed eth (unicm bind IP must match a RoCE GID;
+# net0's 10.11.x fails RegUserMr). Both FLAGCX and NCCL vars must agree or
+# the EIC CID table rejects the first WR.
+IFACE=${IFACE:-eth1}
+export FLAGCX_SOCKET_IFNAME="$IFACE"
+export NCCL_SOCKET_IFNAME="$IFACE"
 export GLOO_SOCKET_IFNAME=net0
 export FLAGCX_DEBUG=INFO
 export FLAGCX_DEBUG_SUBSYS=INIT
