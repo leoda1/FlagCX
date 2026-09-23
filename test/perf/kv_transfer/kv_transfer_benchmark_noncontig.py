@@ -22,11 +22,15 @@ Usage
   # connectors: --connector=nixl|mooncake|flagcx
   # tune block size: --block-bytes 16384
   # tune sizes:      --sizes 64M,256M,1G
+  # replay real inference patterns (non-uniform block lengths extracted from
+  # a prefill log): --real-pattern patterns.json [--iters 2000]
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import random
 import sys
 import time
@@ -45,20 +49,32 @@ _MR_CHUNK_BYTES = 1 << 30
 
 @dataclass
 class Pattern:
-    """One step: ``n`` scattered block transfers (each ``block_bytes``)."""
+    """One step: ``n`` scattered block transfers.
+
+    Uniform mode uses ``block_bytes`` for every WR; real-inference replay
+    keeps per-block ``lengths`` (non-uniform, as logged by the serving
+    engine) while ``block_bytes`` degrades to their gcd, used only for
+    pool-slot alignment.
+    """
     src_offsets: List[int]   # byte offset of each WR in the src pool
     dst_offsets: List[int]   # byte offset of each WR in the dst pool
     tags: List[int]          # 1..255, written by src / checked by dst
     block_bytes: int
     pool_bytes: int
+    lengths: List[int] = None  # per-WR byte count; None -> uniform block_bytes
+    name: str = ""
 
     @property
     def n(self) -> int:
         return len(self.tags)
 
     @property
+    def wr_lens(self) -> List[int]:
+        return self.lengths if self.lengths else [self.block_bytes] * self.n
+
+    @property
     def total_bytes(self) -> int:
-        return self.n * self.block_bytes
+        return sum(self.wr_lens)
 
 
 def make_pattern(total_bytes: int, block_bytes: int, pool_bytes: int,
@@ -81,6 +97,59 @@ def make_pattern(total_bytes: int, block_bytes: int, pool_bytes: int,
         tags=[(i % 255) + 1 for i in range(n)],
         block_bytes=block_bytes,
         pool_bytes=pool_bytes,
+        name=f"{_pretty(total_bytes)}",
+    )
+
+
+def make_real_pattern(lengths: List[int], pool_bytes: int, seed: int,
+                      name: str = "") -> Pattern:
+    """Scatter real (non-uniform) block lengths from a serving log.
+
+    All lengths are multiples of ``g = gcd(lengths)``; blocks are packed
+    back-to-back into runs of g-sized slots, runs are shuffled and placed at
+    a random g-aligned offset in the pool (offsets distinct across runs, so
+    no overlap). Deterministic from ``seed``; src and dst scatter
+    independently.
+    """
+    g = lengths[0]
+    for L in lengths[1:]:
+        g = math.gcd(g, L)
+    pool_slots = pool_bytes // g
+    slots_needed = [L // g for L in lengths]
+    if sum(slots_needed) > pool_slots:
+        raise ValueError(f"need {sum(slots_needed)} slots but pool holds {pool_slots}")
+
+    def scatter(rng_seed: int) -> List[int]:
+        rng = random.Random(rng_seed)
+        order = sorted(range(len(lengths)), key=lambda i: -slots_needed[i])
+        placed: List[Tuple[int, int]] = []  # (start, end) slot ranges
+        offs: List[int] = [0] * len(lengths)
+
+        def hits(s: int, e: int) -> bool:
+            for st, en in placed:
+                if s < en and st < e:
+                    return True
+            return False
+
+        for i in order:
+            span = slots_needed[i]
+            while True:
+                s = rng.randrange(0, pool_slots - span + 1)
+                if not hits(s, s + span):
+                    break
+            placed.append((s, s + span))
+            offs[i] = s * g
+        return offs
+
+    n = len(lengths)
+    return Pattern(
+        src_offsets=scatter(seed),
+        dst_offsets=scatter(seed ^ 0x9E3779B9),
+        tags=[(i % 255) + 1 for i in range(n)],
+        block_bytes=g,
+        pool_bytes=pool_bytes,
+        lengths=list(lengths),
+        name=name,
     )
 
 
@@ -167,8 +236,8 @@ class Transport(ABC):
         self._pat = pat
         self.buffer.zero_()
         if self.is_source:
-            for off, tag in zip(pat.src_offsets, pat.tags):
-                self.buffer[off:off + pat.block_bytes] = tag
+            for off, tag, ln in zip(pat.src_offsets, pat.tags, pat.wr_lens):
+                self.buffer[off:off + ln] = tag
         if self.device == "gpu" and torch.cuda.is_available():
             torch.cuda.synchronize(self.gpu_idx)
 
@@ -176,13 +245,14 @@ class Transport(ABC):
         if self.is_source:
             return
         pat = self._pat
-        for i, (off, tag) in enumerate(zip(pat.dst_offsets, pat.tags)):
-            region = self.buffer[off:off + pat.block_bytes]
+        for i, (off, tag, ln) in enumerate(zip(pat.dst_offsets, pat.tags,
+                                               pat.wr_lens)):
+            region = self.buffer[off:off + ln]
             if not torch.all(region == tag).item():
                 bad = int((region != tag).sum().item())
                 raise AssertionError(
                     f"[{self.role}] VERIFY FAIL: WR {i} @dst {off} "
-                    f"(tag={tag}) has {bad}/{pat.block_bytes} bytes wrong.")
+                    f"(tag={tag}) has {bad}/{ln} bytes wrong.")
 
     @abstractmethod
     def setup_pool(self, pool_bytes: int) -> None: ...
@@ -234,7 +304,8 @@ class NixlTransport(Transport):
         base = self.buffer.data_ptr()
         mem = "VRAM" if self.device == "gpu" else "DRAM"
         devid = self.gpu_idx if self.device == "gpu" else 0
-        descs = [(base + o, pat.block_bytes, devid) for o in offs]
+        descs = [(base + o, ln, devid)
+                 for o, ln in zip(offs, pat.wr_lens)]
         self._xfer = self.agent.get_xfer_descs(descs, mem)
 
     def run_transfer(self):
@@ -315,10 +386,10 @@ class MooncakeTransport(Transport):
     def prepare_step(self, pat):
         self._refresh(pat)
         if self.is_source:
-            base, rb, bs = self.buffer.data_ptr(), self._remote_base, pat.block_bytes
+            base, rb = self.buffer.data_ptr(), self._remote_base
             self._wr = ([base + o for o in pat.src_offsets],
                         [rb + o for o in pat.dst_offsets],
-                        [bs] * pat.n)
+                        list(pat.wr_lens))
             self.sock.send(b"READY")          # barrier: receiver zeroed its pool
         else:
             self.sock.recv()
@@ -390,10 +461,10 @@ class FlagCXTransport(Transport):
     def prepare_step(self, pat):
         self._refresh(pat)
         if self.is_source:
-            base, rb, bs = self.buffer.data_ptr(), self._remote_base, pat.block_bytes
+            base, rb = self.buffer.data_ptr(), self._remote_base
             self._wr = ([base + o for o in pat.src_offsets],
                         [rb + o for o in pat.dst_offsets],
-                        [bs] * pat.n)
+                        list(pat.wr_lens))
             self.sock.send(b"READY")          # barrier: receiver zeroed its pool
         else:
             self.sock.recv()
@@ -423,16 +494,28 @@ def run_size(t: Transport, pat: Pattern, iters: int, warmup: int) -> None:
         t.run_transfer()
     if torch.cuda.is_available() and t.device == "gpu":
         torch.cuda.synchronize(t.gpu_idx)
-    start = time.perf_counter()
+    lat = []
     for _ in range(iters):
+        s = time.perf_counter()
         t.run_transfer()
+        lat.append(time.perf_counter() - s)
     if torch.cuda.is_available() and t.device == "gpu":
         torch.cuda.synchronize(t.gpu_idx)
-    avg = (time.perf_counter() - start) / iters
+    lat.sort()
+    avg = sum(lat) / len(lat)
+
+    def pct(p):
+        return lat[min(len(lat) - 1, int(p * len(lat)))]
+
     bw = (pat.total_bytes / avg) / (1024**3) if avg else 0
-    print(f"  {_pretty(pat.total_bytes):>9s}  |  lat={avg*1000:8.3f} ms  |  "
+    uniq = len(set(pat.wr_lens))
+    blk_desc = (_pretty(pat.block_bytes) if uniq == 1
+                else f"{uniq} sizes, gcd={_pretty(pat.block_bytes)}")
+    print(f"  {pat.name:>16s} {_pretty(pat.total_bytes):>10s}  |  "
+          f"lat avg={avg*1000:8.3f} ms p50={pct(0.5)*1000:8.3f} "
+          f"p99={pct(0.99)*1000:8.3f}  |  "
           f"BW={bw:7.2f} GB/s  ({bw*8*1024**3/1e9:7.2f} Gbps)  |  "
-          f"WRs={pat.n} block={_pretty(pat.block_bytes)}")
+          f"WRs={pat.n} block={blk_desc}", flush=True)
     t.verify()
 
 
@@ -458,6 +541,9 @@ def main() -> None:
     p.add_argument("--mooncake-protocol", default="rdma")
     p.add_argument("--flagcx-lib-path", default=None)
     p.add_argument("--flagcx-path", default=None)
+    p.add_argument("--real-pattern", default=None,
+                   help="JSON file {name: {lengths: [...]}} replayed instead "
+                        "of synthetic uniform sizes (e.g. real_patterns.json)")
     args = p.parse_args()
 
     t = {"nixl": NixlTransport, "mooncake": MooncakeTransport,
@@ -469,14 +555,30 @@ def main() -> None:
           f"block={_pretty(args.block_bytes)} pool={_pretty(pool_bytes)}")
     print("-" * 72)
 
-    t.setup_pool(pool_bytes)
-    try:
+    if args.real_pattern:
+        with open(args.real_pattern) as f:
+            real = json.load(f)
+        pats = [make_real_pattern(v["lengths"], pool_bytes, args.seed, k)
+                for k, v in real.items()]
+        # MR chunk boundaries must stay multiples of every pattern's gcd so no
+        # WR straddles two regions; register with the lcm of all gcds.
+        bb = 1
+        for pat in pats:
+            bb = bb * pat.block_bytes // math.gcd(bb, pat.block_bytes)
+        args.block_bytes = bb
+    else:
+        pats = []
         for size in args.sizes:
             if size // args.block_bytes > pool_blocks:
                 print(f"  size={_pretty(size):>9s} | SKIP: "
                       f"{size // args.block_bytes} blocks > pool {pool_blocks}")
                 continue
-            pat = make_pattern(size, args.block_bytes, pool_bytes, args.seed)
+            pats.append(make_pattern(size, args.block_bytes, pool_bytes,
+                                     args.seed))
+
+    t.setup_pool(pool_bytes)
+    try:
+        for pat in pats:
             run_size(t, pat, args.iters, args.warmup)
     finally:
         t.teardown()
