@@ -14,8 +14,13 @@
 # Error / send retry exhausted, observed 2026-09-23).
 #
 # Usage:
-#   server machine: bash run_real_bench.sh server <own-net0-ip> [iters]
-#   client machine: bash run_real_bench.sh client <server-net0-ip> [iters]
+#   server machine: bash run_real_bench.sh server <own-eth0-ip> [iters]
+#   client machine: bash run_real_bench.sh client <server-eth0-ip> [iters]
+#
+# All planes (zmq, FlagCX rpc/hello, barex unicm) MUST stay on the same
+# interface (eth0 / 22.2.x RDMA net): the EIC connection table is keyed by
+# the address the hello exchange advertises; mixing net0 (hello) with eth0
+# (unicm bind) yields "Send CID HW Error" on first WR.
 set -u
 cd "$(dirname "$0")"
 ROLE=${1:?server|client}
@@ -33,8 +38,8 @@ sleep 1
 FLAGCX_ROOT=$(cd ../../.. && pwd)
 export FLAGCX_P2P_TRANSPORT=accl
 export FLAGCX_IB_HCA=vsolar_0
-export FLAGCX_SOCKET_IFNAME=net0        # FlagCX control plane: internal net
-export NCCL_SOCKET_IFNAME=eth0          # barex unicm discovery: RDMA net
+export FLAGCX_SOCKET_IFNAME=eth0        # FlagCX hello: RDMA net (must match
+export NCCL_SOCKET_IFNAME=eth0          # barex unicm bind: same interface)
 export FLAGCX_MEM_ENABLE=1
 export FLAGCX_VMM_ENABLE=0
 export FLAGCX_DEBUG=INFO
