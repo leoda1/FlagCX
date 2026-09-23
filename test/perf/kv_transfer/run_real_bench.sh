@@ -37,9 +37,17 @@ sleep 1
 
 FLAGCX_ROOT=$(cd ../../.. && pwd)
 export FLAGCX_P2P_TRANSPORT=accl
-export FLAGCX_IB_HCA=vsolar_0
-export FLAGCX_SOCKET_IFNAME=eth0        # FlagCX hello: RDMA net (must match
-export NCCL_SOCKET_IFNAME=eth0          # barex unicm bind: same interface)
+if [ "$ROLE" = server ]; then
+  # server interface is picked by the caller (SRV_IF, default eth0); both the
+  # FlagCX listener and the barex unicm bind must sit on it. Pick the one the
+  # client's route egress lands on (same ethN both sides => same vsolar_N).
+  SRV_IF=${SRV_IF:-eth0}
+  export FLAGCX_SOCKET_IFNAME="$SRV_IF"
+  export NCCL_SOCKET_IFNAME="$SRV_IF"
+  export FLAGCX_IB_HCA="vsolar_${SRV_IF#eth}"
+else
+  :  # client derives its egress below
+fi
 export FLAGCX_MEM_ENABLE=1
 export FLAGCX_VMM_ENABLE=0
 export FLAGCX_DEBUG=INFO
@@ -65,6 +73,7 @@ else
   SRC_IF=$(ip route get "$ADDR" | head -1 | sed -n 's/.* dev \([a-z0-9]*\) .*/\1/p')
   NIC_ID=${SRC_IF#eth}
   export NCCL_SOCKET_IFNAME="$SRC_IF"
+  export FLAGCX_SOCKET_IFNAME="$SRC_IF"
   export FLAGCX_IB_HCA="vsolar_$NIC_ID"
   echo "client egress: $SRC_IF -> $FLAGCX_IB_HCA"
   sleep 5
